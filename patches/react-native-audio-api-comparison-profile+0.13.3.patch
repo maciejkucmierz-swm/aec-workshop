@@ -1,0 +1,150 @@
+diff --git a/common/cpp/audioapi/core/utils/VoiceProcessingProfile.h b/common/cpp/audioapi/core/utils/VoiceProcessingProfile.h
+new file mode 100644
+index 0000000..5f5f7d2
+--- /dev/null
++++ b/common/cpp/audioapi/core/utils/VoiceProcessingProfile.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <atomic>
++
++namespace audioapi {
++
++// Selected before a live context or recorder opens its native stream.
++// Default to the app's patched voice profile to preserve existing behavior.
++inline std::atomic_bool voiceProcessingProfileEnabled{true};
++
++} // namespace audioapi
+diff --git a/common/cpp/audioapi/AudioAPIModuleInstaller.h b/common/cpp/audioapi/AudioAPIModuleInstaller.h
+index 5cbd0d1..f6f02c3 100644
+--- a/common/cpp/audioapi/AudioAPIModuleInstaller.h
++++ b/common/cpp/audioapi/AudioAPIModuleInstaller.h
+@@ -16,6 +16,7 @@
+ #include <audioapi/events/AudioEventHandlerRegistry.h>
+ 
+ #include <audioapi/core/utils/worklets/SafeIncludes.h>
++#include <audioapi/core/utils/VoiceProcessingProfile.h>
+ 
+ #include <memory>
+ namespace audioapi {
+@@ -39,6 +40,15 @@ class AudioAPIModuleInstaller {
+     auto createAudioBuffer = getCreateAudioBufferFunction(jsiRuntime);
+     auto createAudioDecoder = getCreateAudioDecoderFunction(jsiRuntime, jsCallInvoker);
+     auto createAudioFileUtils = getCreateAudioFileUtilsFunction(jsiRuntime, jsCallInvoker);
++    auto setVoiceProcessingProfile = jsi::Function::createFromHostFunction(
++        *jsiRuntime,
++        jsi::PropNameID::forAscii(*jsiRuntime, "setAudioApiVoiceProcessingProfile"),
++        1,
++        [](jsi::Runtime &, const jsi::Value &, const jsi::Value *args, size_t count) {
++          voiceProcessingProfileEnabled.store(
++              count > 0 && args[0].isBool() && args[0].getBool(), std::memory_order_release);
++          return jsi::Value::undefined();
++        });
+ 
+     jsiRuntime->global().setProperty(*jsiRuntime, "createAudioContext", createAudioContext);
+     jsiRuntime->global().setProperty(*jsiRuntime, "createAudioRecorder", createAudioRecorder);
+@@ -47,6 +57,8 @@ class AudioAPIModuleInstaller {
+     jsiRuntime->global().setProperty(*jsiRuntime, "createAudioBuffer", createAudioBuffer);
+     jsiRuntime->global().setProperty(*jsiRuntime, "createAudioDecoder", createAudioDecoder);
+     jsiRuntime->global().setProperty(*jsiRuntime, "createAudioFileUtils", createAudioFileUtils);
++    jsiRuntime->global().setProperty(
++        *jsiRuntime, "setAudioApiVoiceProcessingProfile", setVoiceProcessingProfile);
+ 
+     auto audioEventHandlerRegistryHostObject =
+         std::make_shared<AudioEventHandlerRegistryHostObject>(audioEventHandlerRegistry);
+diff --git a/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp b/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp
+index 6e6a3c9..2bcd471 100644
+--- a/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp
++++ b/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp
+@@ -3,6 +3,7 @@
+ #include <audioapi/core/AudioContext.h>
+ #include <audioapi/core/utils/Constants.h>
+ #include <audioapi/core/utils/CurrentRenderScope.h>
++#include <audioapi/core/utils/VoiceProcessingProfile.h>
+ #include <audioapi/utils/AudioArray.hpp>
+ 
+ #include <jni.h>
+@@ -39,6 +40,28 @@ AudioPlayer::AudioPlayer(
+ bool AudioPlayer::openAudioStream() {
+   AudioStreamBuilder builder;
+ 
++  if (!voiceProcessingProfileEnabled.load(std::memory_order_acquire)) {
++    builder.setSharingMode(SharingMode::Exclusive)
++        ->setFormat(AudioFormat::Float)
++        ->setFormatConversionAllowed(true)
++        ->setPerformanceMode(PerformanceMode::LowLatency)
++        ->setChannelCount(channelCount_)
++        ->setSampleRateConversionQuality(SampleRateConversionQuality::Medium)
++        ->setFramesPerDataCallback(RENDER_QUANTUM_SIZE)
++        ->setDataCallback(shared_from_this())
++        ->setErrorCallback(shared_from_this())
++        ->setSampleRate(static_cast<int>(sampleRate_));
++    auto result = builder.openStream(mStream_);
++    if (result != oboe::Result::OK || mStream_ == nullptr) {
++      __android_log_print(
++          ANDROID_LOG_ERROR, "AudioPlayer", "Failed to open stream: %s", oboe::convertToText(result));
++      return false;
++    }
++    buffer_ = std::make_shared<DSPAudioBuffer>(RENDER_QUANTUM_SIZE, channelCount_, sampleRate_);
++    isInitialized_.store(true, std::memory_order_release);
++    return true;
++  }
++
+   // Oboe defaults output to Usage::Media, which puts playback on the media
+   // stream: media volume slider, media routing, and nothing the platform echo
+   // canceller references. VoiceCommunication maps to
+diff --git a/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp b/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp
+index 4c3bd76..cf77ef8 100644
+--- a/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp
++++ b/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp
+@@ -1,5 +1,6 @@
+ #include <android/log.h>
+ #include <audioapi/android/core/AndroidAudioRecorder.h>
++#include <audioapi/core/utils/VoiceProcessingProfile.h>
+ #include <audioapi/android/core/utils/AndroidFileWriterBackend.h>
+ #include <audioapi/android/core/utils/AndroidRecorderCallback.h>
+ 
+@@ -77,6 +78,16 @@ Result<NoneType, std::string> AndroidAudioRecorder::openAudioStream() {
+   }
+ 
+   oboe::AudioStreamBuilder builder;
++  if (!voiceProcessingProfileEnabled.load(std::memory_order_acquire)) {
++    builder.setSharingMode(oboe::SharingMode::Exclusive)
++        ->setDirection(oboe::Direction::Input)
++        ->setFormat(oboe::AudioFormat::Float)
++        ->setFormatConversionAllowed(true)
++        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
++        ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
++        ->setDataCallback(shared_from_this())
++        ->setErrorCallback(shared_from_this());
++  } else {
+   // Oboe defaults capture to InputPreset::VoiceRecognition because it has the
+   // lowest latency, but that preset asks for no voice processing.
+   // VoiceCommunication maps to MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+@@ -94,6 +106,7 @@ Result<NoneType, std::string> AndroidAudioRecorder::openAudioStream() {
+       ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
+       ->setDataCallback(shared_from_this())
+       ->setErrorCallback(shared_from_this());
++  }
+ 
+   auto result = builder.openStream(mStream_);
+ 
+diff --git a/ios/audioapi/ios/system/AudioEngine.mm b/ios/audioapi/ios/system/AudioEngine.mm
+index 5ef70e8..1f02bcd 100644
+--- a/ios/audioapi/ios/system/AudioEngine.mm
++++ b/ios/audioapi/ios/system/AudioEngine.mm
+@@ -1,4 +1,5 @@
+ #import <audioapi/ios/system/AudioEngine.h>
++#include <audioapi/core/utils/VoiceProcessingProfile.h>
+ #import <audioapi/ios/system/AudioSessionManager.h>
+ 
+ #include <mutex>
+@@ -64,7 +65,8 @@ static AudioEngine *_sharedInstance = nil;
+   // connected or the engine is started; each graph rebuild gets a new engine
+   // and therefore needs the opt-in again.
+-  if (self.sessionManager.desiredMode == AVAudioSessionModeVoiceChat) {
++  if (audioapi::voiceProcessingProfileEnabled.load(std::memory_order_acquire) &&
++      self.sessionManager.desiredMode == AVAudioSessionModeVoiceChat) {
+     NSError *error = nil;
+     if (![self.audioEngine.inputNode setVoiceProcessingEnabled:YES error:&error]) {
+       NSLog(@"[AudioEngine] Failed to enable voice processing: %@", error);

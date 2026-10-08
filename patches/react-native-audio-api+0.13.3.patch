@@ -1,0 +1,71 @@
+--- a/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp
++++ b/android/src/main/cpp/audioapi/android/core/AudioPlayer.cpp
+@@ -31,10 +31,22 @@
+ bool AudioPlayer::openAudioStream() {
+   AudioStreamBuilder builder;
+ 
+-  builder.setSharingMode(SharingMode::Exclusive)
++  // Oboe defaults output to Usage::Media, which puts playback on the media
++  // stream: media volume slider, media routing, and nothing the platform echo
++  // canceller references. VoiceCommunication maps to
++  // AudioAttributes.USAGE_VOICE_COMMUNICATION, so playback lands on the call
++  // stream instead, which is what makes it visible to the HAL canceller.
++  //
++  // Shared + None keeps the stream off the MMAP fast path. That path is
++  // exclusive of the mixer where communication pre/post-processing lives, so
++  // asking for low latency here would opt back out of the very processing we
++  // want. A few ms of added latency is irrelevant next to network round trips.
++  builder.setSharingMode(SharingMode::Shared)
+       ->setFormat(AudioFormat::Float)
+       ->setFormatConversionAllowed(true)
+-      ->setPerformanceMode(PerformanceMode::LowLatency)
++      ->setPerformanceMode(PerformanceMode::None)
++      ->setUsage(Usage::VoiceCommunication)
++      ->setContentType(ContentType::Speech)
+       ->setChannelCount(channelCount_)
+       ->setSampleRateConversionQuality(SampleRateConversionQuality::Medium)
+       ->setFramesPerDataCallback(RENDER_QUANTUM_SIZE)
+--- a/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp
++++ b/android/src/main/cpp/audioapi/android/core/AndroidAudioRecorder.cpp
+@@ -69,11 +69,20 @@
+   }
+ 
+   oboe::AudioStreamBuilder builder;
+-  builder.setSharingMode(oboe::SharingMode::Exclusive)
++  // Oboe defaults capture to InputPreset::VoiceRecognition because it has the
++  // lowest latency, but that preset asks for no voice processing.
++  // VoiceCommunication maps to MediaRecorder.AudioSource.VOICE_COMMUNICATION,
++  // the source Android documents as taking advantage of echo cancellation and
++  // automatic gain control where the device offers them.
++  //
++  // Shared + None for the same reason as playback: the effects that implement
++  // that cancellation sit in the path the MMAP fast path skips.
++  builder.setSharingMode(oboe::SharingMode::Shared)
+       ->setDirection(oboe::Direction::Input)
++      ->setInputPreset(oboe::InputPreset::VoiceCommunication)
+       ->setFormat(oboe::AudioFormat::Float)
+       ->setFormatConversionAllowed(true)
+-      ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
++      ->setPerformanceMode(oboe::PerformanceMode::None)
+       ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
+       ->setDataCallback(shared_from_this())
+       ->setErrorCallback(shared_from_this());
+--- a/ios/audioapi/ios/system/AudioEngine.mm
++++ b/ios/audioapi/ios/system/AudioEngine.mm
+@@ -56,6 +56,18 @@ - (void)createAudioEngineIfNeeded
+   }
+ 
+   self.audioEngine = [[AVAudioEngine alloc] init];
++
++  // AVAudioSessionModeVoiceChat only describes the kind of session. Apple
++  // applies its actual AEC/NS/AGC voice path to AVAudioEngine only after the
++  // I/O node opts in to voice processing. Do this before the input is
++  // connected or the engine is started; each graph rebuild gets a new engine
++  // and therefore needs the opt-in again.
++  if (self.sessionManager.desiredMode == AVAudioSessionModeVoiceChat) {
++    NSError *error = nil;
++    if (![self.audioEngine.inputNode setVoiceProcessingEnabled:YES error:&error]) {
++      NSLog(@"[AudioEngine] Failed to enable voice processing: %@", error);
++    }
++  }
+ }
