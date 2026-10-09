@@ -1,9 +1,8 @@
 import { useCallback, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { useFocusEffect } from "expo-router";
 
 import { AecDiagnostic } from "@/components/expo-audio/aec-diagnostic";
-import { HalfDuplexAgent } from "@/components/expo-audio/half-duplex-agent";
+import { ExpoVoiceAgent } from "@/components/expo-audio/voice-agent";
 import {
   useWorkshopColors,
   WorkshopSurface,
@@ -15,20 +14,12 @@ type AlternativeMode = "half-duplex" | "aec-diagnostic";
 export default function ExpoAlternativesScreen() {
   const colors = useWorkshopColors();
   const [mode, setMode] = useState<AlternativeMode>("half-duplex");
-  const [focused, setFocused] = useState(true);
   const [diagnosticNotice, setDiagnosticNotice] = useState<string | null>(null);
 
   const clearDiagnosticNotice = useCallback(() => setDiagnosticNotice(null), []);
   const noteDiagnosticCancellation = useCallback(
     () => setDiagnosticNotice("Diagnostic cancelled when leaving the experiment."),
     [],
-  );
-
-  useFocusEffect(
-    useCallback(() => {
-      setFocused(true);
-      return () => setFocused(false);
-    }, []),
   );
 
   return (
@@ -55,8 +46,8 @@ export default function ExpoAlternativesScreen() {
             </Pressable>
           ))}
         </View>
-        {focused && mode === "half-duplex" ? <HalfDuplexAgent /> : null}
-        {focused && mode === "aec-diagnostic" ? (
+        {mode === "half-duplex" ? <ExpoVoiceAgent mode="half-duplex" /> : null}
+        {mode === "aec-diagnostic" ? (
           <AecDiagnostic
             initialDetail={diagnosticNotice}
             onRunStarted={clearDiagnosticNotice}

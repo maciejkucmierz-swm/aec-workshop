@@ -23,8 +23,9 @@ import {
   wordOverlapRatio,
 } from "@/lib/audio-metrics";
 import { fetchEphemeralKey } from "@/lib/token-url";
+import realtimeConfig from "../../shared/realtime-config.json";
 
-const MODEL = "gpt-realtime-2.1-mini";
+const MODEL = realtimeConfig.model;
 const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${MODEL}`;
 const RECENT_EVENT_LIMIT = 5;
 const DIAGNOSTICS_INTERVAL_MS = 250;
@@ -130,28 +131,7 @@ type ServerEvent = {
 // The model is fixed by the connect URL, so it is intentionally absent here.
 const SESSION_UPDATE = {
   type: "session.update",
-  session: {
-    type: "realtime",
-    output_modalities: ["audio"],
-    audio: {
-      input: {
-        format: { type: "audio/pcm", rate: REALTIME_SAMPLE_RATE },
-        transcription: { model: "gpt-4o-mini-transcribe" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
-          create_response: false,
-          interrupt_response: true,
-        },
-      },
-      output: {
-        format: { type: "audio/pcm", rate: REALTIME_SAMPLE_RATE },
-        voice: "marin",
-      },
-    },
-  },
+  session: realtimeConfig.session,
 };
 
 function emptyDiagnostics(): SessionDiagnostics {

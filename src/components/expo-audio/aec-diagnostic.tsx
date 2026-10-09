@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
+import { useFocusEffect } from "expo-router";
 import { Platform, Pressable, ScrollView, StyleSheet, Text } from "react-native";
 import { File } from "expo-file-system";
 import {
@@ -74,9 +75,13 @@ export function AecDiagnostic({
           // A cancellation can race the recorder's normal completion path.
         }
       }
-      const recordingFile = activeFileRef.current ?? (recorder.uri ? new File(recorder.uri) : null);
+      const recordingFile = activeFileRef.current ?? (
+        recorder.uri ? new File(recorder.uri) : null
+      );
       activeFileRef.current = null;
-      recordingFile?.delete();
+      if (recordingFile?.exists) {
+        recordingFile.delete();
+      }
     })();
 
     captureCleanupRef.current = cleanup;
@@ -97,13 +102,17 @@ export function AecDiagnostic({
     return wasRunning;
   }, [releaseCapture]);
 
-  useEffect(() => {
-    return () => {
-      if (cancelRun()) {
-        onCancelled();
-      }
-    };
-  }, [cancelRun, onCancelled]);
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        if (cancelRun()) {
+          setResults([]);
+          setDetail("Diagnostic cancelled when leaving the experiment.");
+          onCancelled();
+        }
+      };
+    }, [cancelRun, onCancelled]),
+  );
 
   const ensureCurrentRun = useCallback((runEpoch: number) => {
     if (runEpoch !== runEpochRef.current) {
@@ -213,6 +222,10 @@ export function AecDiagnostic({
       if (runEpoch === runEpochRef.current) {
         runActiveRef.current = false;
         setRunning(false);
+      } else if (!runActiveRef.current) {
+        // Keep Run disabled until the cancelled task's finally block has
+        // stopped/deleted its capture, even if this tab is already visible.
+        setRunning(false);
       }
     }
   }, [ensureCurrentRun, onRunStarted, runCapture, running]);
@@ -226,9 +239,19 @@ export function AecDiagnostic({
     );
   }
 
-  const micMedian = median(results.filter((result) => result.source === "mic").map((result) => result.echoGainDb));
-  const voiceMedian = median(results.filter((result) => result.source === "voice_communication").map((result) => result.echoGainDb));
-  const improvement = micMedian !== null && voiceMedian !== null ? micMedian - voiceMedian : null;
+  const micMedian = median(
+    results
+      .filter((result) => result.source === "mic")
+      .map((result) => result.echoGainDb),
+  );
+  const voiceMedian = median(
+    results
+      .filter((result) => result.source === "voice_communication")
+      .map((result) => result.echoGainDb),
+  );
+  const improvement = micMedian !== null && voiceMedian !== null
+    ? micMedian - voiceMedian
+    : null;
 
   return (
     <>
@@ -239,24 +262,34 @@ export function AecDiagnostic({
       <Text style={[styles.instructions, { color: colors.text }]}>
         Set the same loudspeaker volume, lay the phone still, and do not speak during the 6 captures.
       </Text>
-      {detail ? <Text style={[styles.muted, { color: colors.muted }]}>{detail}</Text> : null}
-      <ScrollView style={styles.results} contentContainerStyle={styles.resultsContent}>
-        {results.map((result, index) => (
-          <Text
-            key={`${result.source}-${index}`}
-            style={[styles.diagnosticText, { color: colors.text }]}
-          >
-            {`${result.source.replace("_", " ")} #${results.filter(
-              (entry) => entry.source === result.source,
-            ).indexOf(result) + 1}: correlation ${result.peakCorrelation} · ${
-              result.echoGainDb
-            } dB · ${result.estimatedLagMs} ms`}
-          </Text>
-        ))}
+      {detail ? (
+        <Text style={[styles.muted, { color: colors.muted }]}>{detail}</Text>
+      ) : null}
+      <ScrollView
+        style={styles.results}
+        contentContainerStyle={styles.resultsContent}
+      >
+        {results.map((result, index) => {
+          const runNumber = results
+            .filter((entry) => entry.source === result.source)
+            .indexOf(result) + 1;
+
+          return (
+            <Text
+              key={`${result.source}-${index}`}
+              style={[styles.diagnosticText, { color: colors.text }]}
+            >
+              {`${result.source.replace("_", " ")} #${runNumber}: `}
+              {`correlation ${result.peakCorrelation} · ${result.echoGainDb} dB · ${result.estimatedLagMs} ms`}
+            </Text>
+          );
+        })}
       </ScrollView>
       {improvement !== null ? (
         <Text style={[styles.summary, { color: colors.text }]}>
-          Median echo gain: mic {micMedian?.toFixed(1)} dB · voice communication {voiceMedian?.toFixed(1)} dB · reduction {improvement.toFixed(1)} dB
+          Median echo gain: mic {micMedian?.toFixed(1)} dB
+          {" · voice communication "}{voiceMedian?.toFixed(1)} dB
+          {" · reduction "}{improvement.toFixed(1)} dB
           {improvement >= 10
             ? " (interesting device-specific result)"
             : " (no ≥10 dB benefit)"}

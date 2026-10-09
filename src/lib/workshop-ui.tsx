@@ -53,7 +53,10 @@ export function WorkshopSurface({ children }: { children: ReactNode }) {
       style={[workshopStyles.safeArea, { backgroundColor: colors.background }]}
       edges={Platform.OS === "ios" ? ["top", "bottom"] : ["top"]}
     >
-      <KeyboardAvoidingView style={workshopStyles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAvoidingView
+        style={workshopStyles.screen}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
         {children}
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -72,7 +75,9 @@ export function WorkshopHeading({
 
   return (
     <View>
-      <Text style={[workshopStyles.heading, { color: colors.text }]}>{title}</Text>
+      <Text style={[workshopStyles.heading, { color: colors.text }]}>
+        {title}
+      </Text>
       <Text style={[workshopStyles.description, { color: colors.muted }]}>
         {description}
       </Text>
@@ -90,19 +95,50 @@ export const workshopStyles = StyleSheet.create({
   statusDot: { width: 10, height: 10, borderRadius: 5 },
   statusText: { fontSize: 16, fontWeight: "600" },
   composer: { flexDirection: "row", alignItems: "center", gap: 8 },
-  input: { flex: 1, borderWidth: StyleSheet.hairlineWidth, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, fontSize: 14 },
-  sendButton: { borderRadius: 8, backgroundColor: "#208AEF", justifyContent: "center", paddingHorizontal: 12, paddingVertical: 7 },
+  input: {
+    flex: 1,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    fontSize: 14,
+  },
+  sendButton: {
+    borderRadius: 8,
+    backgroundColor: "#208AEF",
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
   sendLabel: { color: "white", fontSize: 13, fontWeight: "600" },
   buttonDisabled: { opacity: 0.4 },
   utilityRow: { flexDirection: "row", gap: 8 },
-  utilityButton: { flex: 1, alignItems: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 8, paddingVertical: 5 },
+  utilityButton: {
+    flex: 1,
+    alignItems: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 8,
+    paddingVertical: 5,
+  },
   utilityButtonActive: { backgroundColor: "#208AEF" },
   utilityLabel: { fontSize: 12, fontWeight: "600" },
-  modeRow: { flexDirection: "row", borderWidth: StyleSheet.hairlineWidth, borderRadius: 9, padding: 2, gap: 2 },
+  modeRow: {
+    flexDirection: "row",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 9,
+    padding: 2,
+    gap: 2,
+  },
   modeButton: { flex: 1, alignItems: "center", paddingVertical: 5, borderRadius: 7 },
   modeButtonSelected: { backgroundColor: "#208AEF" },
   modeLabel: { fontSize: 13, fontWeight: "600" },
-  callButton: { alignItems: "center", paddingVertical: 12, borderRadius: 10, backgroundColor: "#208AEF", marginBottom: 12 },
+  callButton: {
+    alignItems: "center",
+    paddingVertical: 12,
+    borderRadius: 10,
+    backgroundColor: "#208AEF",
+    marginBottom: 12,
+  },
   callButtonStop: { backgroundColor: "#FF453A" },
   callLabel: { color: "white", fontSize: 16, fontWeight: "600" },
 });

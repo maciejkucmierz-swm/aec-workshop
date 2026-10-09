@@ -1,0 +1,623 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import {
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import {
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  useAudioPlayer,
+  useAudioPlayerStatus,
+  useAudioStream,
+} from "expo-audio";
+
+import { encodeBase64, REALTIME_SAMPLE_RATE } from "@/lib/pcm";
+import { resolveVoiceSocketUrl } from "@/lib/token-url";
+import {
+  WORKSHOP_STATUS_COLOR,
+  WorkshopHeading,
+  useWorkshopColors,
+  workshopStyles,
+} from "@/lib/workshop-ui";
+
+type RelayPhase = "idle" | "connecting" | "listening" | "assistant" | "error";
+type TranscriptEntry = { id: string; role: "user" | "assistant"; text: string };
+type DuplexMode = "half-duplex" | "full-duplex";
+type Diagnostics = {
+  sentDuringPlayback: number;
+  receivedMicBuffers: number | null;
+  interruptions: number;
+};
+
+const EMPTY_DIAGNOSTICS: Diagnostics = {
+  sentDuringPlayback: 0,
+  receivedMicBuffers: null,
+  interruptions: 0,
+};
+
+const PHASE_COLOR: Record<RelayPhase, string> = {
+  idle: WORKSHOP_STATUS_COLOR.idle,
+  connecting: WORKSHOP_STATUS_COLOR.connecting,
+  listening: WORKSHOP_STATUS_COLOR.connected,
+  assistant: WORKSHOP_STATUS_COLOR.connected,
+  error: WORKSHOP_STATUS_COLOR.error,
+};
+
+function resampleToRealtime(data: ArrayBuffer, inputRate: number): Uint8Array {
+  const input = new Int16Array(data);
+  if (inputRate === REALTIME_SAMPLE_RATE) {
+    return new Uint8Array(data);
+  }
+
+  const outputFrames = Math.max(
+    1,
+    Math.round((input.length * REALTIME_SAMPLE_RATE) / inputRate),
+  );
+  const output = new Uint8Array(outputFrames * 2);
+  const ratio = inputRate / REALTIME_SAMPLE_RATE;
+  for (let index = 0; index < outputFrames; index += 1) {
+    const position = index * ratio;
+    const left = Math.floor(position);
+    const right = Math.min(left + 1, input.length - 1);
+    const blend = position - left;
+    const sample = Math.round(input[left] * (1 - blend) + input[right] * blend);
+    output[index * 2] = sample & 0xff;
+    output[index * 2 + 1] = (sample >> 8) & 0xff;
+  }
+  return output;
+}
+
+export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
+  const colors = useWorkshopColors();
+  const socketRef = useRef<WebSocket | null>(null);
+  const connectionEpochRef = useRef(0);
+  const relayReadyRef = useRef(false);
+  const micEnabledRef = useRef(false);
+  const micTaskRef = useRef<Promise<void>>(Promise.resolve());
+  const firstMicFrameRef = useRef(true);
+  const diagnosticsRef = useRef({ ...EMPTY_DIAGNOSTICS });
+  const playbackRef = useRef<{
+    id: string;
+    legacy: boolean;
+    connectionEpoch: number;
+    observedPlaying: boolean;
+  } | null>(null);
+  const playingRef = useRef(false);
+  const [phase, setPhase] = useState<RelayPhase>("idle");
+  const [detail, setDetail] = useState<string | null>(null);
+  const [entries, setEntries] = useState<TranscriptEntry[]>([]);
+  const [draft, setDraft] = useState("");
+  const [captureInfo, setCaptureInfo] = useState("--");
+  const [diagnostics, setDiagnostics] = useState(EMPTY_DIAGNOSTICS);
+
+  const player = useAudioPlayer(null, {
+    downloadFirst: false,
+    updateInterval: 100,
+  });
+  const playerStatus = useAudioPlayerStatus(player);
+
+  const send = useCallback((message: unknown) => {
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    socketRef.current.send(JSON.stringify(message));
+    return true;
+  }, []);
+
+  const metric = useCallback(
+    (name: string, id?: string) => {
+      const at = Date.now();
+      console.info(`[Expo ${mode}] ${name} turn=${id ?? "--"} at=${at}`);
+      send({ type: "metric", name: `${mode}-${name}`, id, at });
+    },
+    [mode, send],
+  );
+
+  const { stream, isStreaming } = useAudioStream({
+    sampleRate: REALTIME_SAMPLE_RATE,
+    channels: 1,
+    encoding: "int16",
+    onBuffer: ({ data, sampleRate, channels }) => {
+      if (!relayReadyRef.current || !micEnabledRef.current || channels !== 1) {
+        return;
+      }
+      const pcm = resampleToRealtime(data, sampleRate);
+      if (firstMicFrameRef.current) {
+        firstMicFrameRef.current = false;
+        setCaptureInfo(
+          `mono Int16 · ${sampleRate} Hz → ${REALTIME_SAMPLE_RATE} Hz`,
+        );
+        metric("first-mic-frame");
+      }
+      if (send({ type: "audio", data: encodeBase64(pcm) }) && playingRef.current) {
+        diagnosticsRef.current.sentDuringPlayback += 1;
+      }
+    },
+  });
+
+  const upsertTranscript = useCallback(
+    (
+      role: TranscriptEntry["role"],
+      id: string | undefined,
+      text: string,
+      append: boolean,
+    ) => {
+      const entryId = id ?? `${role}-${Date.now()}`;
+      setEntries((current) => {
+        const index = current.findIndex((entry) => entry.id === entryId);
+        if (index === -1) {
+          return [...current, { id: entryId, role, text }];
+        }
+        const next = [...current];
+        next[index] = {
+          ...next[index],
+          text: append ? next[index].text + text : text,
+        };
+        return next;
+      });
+    },
+    [],
+  );
+
+  const stopMic = useCallback(() => {
+    micEnabledRef.current = false;
+    const stop = () => {
+      try {
+        stream.stop();
+      } catch {
+        // Expo Audio may already have released the stream.
+      }
+    };
+    stop();
+    // A pending native start may finish after the synchronous stop. Queue a
+    // final stop before allowing the next connection to start this stream.
+    micTaskRef.current = micTaskRef.current.then(stop, stop);
+  }, [stream]);
+
+  const stopPlayback = useCallback(() => {
+    playbackRef.current = null;
+    playingRef.current = false;
+    try {
+      player.pause();
+    } catch {
+      // The player can already have been released while a tab is changing.
+    }
+  }, [player]);
+
+  const endConnection = useCallback(
+    (nextPhase?: RelayPhase, nextDetail?: string) => {
+      connectionEpochRef.current += 1;
+      relayReadyRef.current = false;
+      const socket = socketRef.current;
+      socketRef.current = null;
+      stopMic();
+      stopPlayback();
+      socket?.close();
+      if (nextDetail !== undefined) {
+        setDetail(nextDetail);
+      }
+      if (nextPhase) {
+        setPhase(nextPhase);
+      }
+    },
+    [stopMic, stopPlayback],
+  );
+
+  const startMic = useCallback(() => {
+    if (!relayReadyRef.current || micEnabledRef.current) {
+      return;
+    }
+    const connectionEpoch = connectionEpochRef.current;
+    micEnabledRef.current = true;
+    firstMicFrameRef.current = true;
+    micTaskRef.current = micTaskRef.current
+      .then(async () => {
+        if (connectionEpoch !== connectionEpochRef.current || !micEnabledRef.current) {
+          return;
+        }
+        await stream.start();
+        if (
+          connectionEpoch !== connectionEpochRef.current ||
+          !relayReadyRef.current ||
+          !micEnabledRef.current
+        ) {
+          stream.stop();
+          return;
+        }
+        setPhase(playbackRef.current ? "assistant" : "listening");
+        metric("mic-resumed");
+      })
+      .catch((error) => {
+        if (connectionEpoch === connectionEpochRef.current) {
+          endConnection("error", `Could not start Expo Audio stream: ${String(error)}`);
+        }
+      });
+    return micTaskRef.current;
+  }, [endConnection, metric, stream]);
+
+  const stopTurn = useCallback(
+    (reason: unknown) => {
+      const playback = playbackRef.current;
+      if (!playback) {
+        return;
+      }
+      if (reason === "barge-in") {
+        diagnosticsRef.current.interruptions += 1;
+        metric("playback-interrupted", playback.id);
+      }
+      stopPlayback();
+      if (reason !== "replaced") {
+        if (mode === "half-duplex") {
+          void startMic();
+        } else {
+          setPhase("listening");
+        }
+      }
+    },
+    [metric, mode, startMic, stopPlayback],
+  );
+
+  const connect = useCallback(async () => {
+    if (phase === "connecting" || phase === "listening" || phase === "assistant") {
+      endConnection("idle");
+      return;
+    }
+
+    endConnection();
+    const connectionEpoch = ++connectionEpochRef.current;
+    setPhase("connecting");
+    setDetail(null);
+    setEntries([]);
+    setCaptureInfo("--");
+    diagnosticsRef.current = { ...EMPTY_DIAGNOSTICS };
+    setDiagnostics({ ...EMPTY_DIAGNOSTICS });
+    firstMicFrameRef.current = true;
+    try {
+      const permission = await requestRecordingPermissionsAsync();
+      if (connectionEpoch !== connectionEpochRef.current) {
+        return;
+      }
+      if (!permission.granted) {
+        throw new Error("Microphone permission was denied");
+      }
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: "doNotMix",
+        shouldRouteThroughEarpiece: false,
+      });
+      if (connectionEpoch !== connectionEpochRef.current) {
+        return;
+      }
+      const socket = new WebSocket(resolveVoiceSocketUrl());
+      if (connectionEpoch !== connectionEpochRef.current) {
+        socket.close();
+        return;
+      }
+      socketRef.current = socket;
+      const isCurrentSocket = () =>
+        connectionEpoch === connectionEpochRef.current && socketRef.current === socket;
+      socket.onerror = () => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        endConnection(
+          "error",
+          "Relay WebSocket error. Check the local token server and LAN address.",
+        );
+      };
+      socket.onclose = () => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        endConnection("idle");
+      };
+      socket.onmessage = (message) => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(String(message.data)) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        if (event.type === "relay.ready") {
+          relayReadyRef.current = true;
+          void startMic();
+          return;
+        }
+        if (event.type === "relay.stats" && typeof event.receivedMicBuffers === "number") {
+          diagnosticsRef.current.receivedMicBuffers = event.receivedMicBuffers;
+          return;
+        }
+        if (event.type === "transcript" && typeof event.delta === "string") {
+          upsertTranscript(
+            event.role === "user" ? "user" : "assistant",
+            typeof event.id === "string" ? event.id : undefined,
+            event.delta,
+            true,
+          );
+          return;
+        }
+        if (event.type === "transcript.done" && typeof event.text === "string") {
+          upsertTranscript(
+            event.role === "user" ? "user" : "assistant",
+            typeof event.id === "string" ? event.id : undefined,
+            event.text,
+            false,
+          );
+          return;
+        }
+        if (event.type === "audio.start" && typeof event.url === "string") {
+          // Older relay messages omit the ID, but their opaque URL already
+          // uniquely identifies the turn. Do not discard playable audio.
+          const legacy = typeof event.id !== "string";
+          const id = typeof event.id === "string" ? event.id : event.url;
+          if (mode === "half-duplex") {
+            stopMic();
+            metric("mic-paused", id);
+          }
+          stopPlayback();
+          playbackRef.current = {
+            id,
+            legacy,
+            connectionEpoch,
+            observedPlaying: false,
+          };
+          setPhase("assistant");
+          try {
+            metric("playback-replaced", id);
+            player.replace({ uri: event.url });
+            player.play();
+          } catch (error) {
+            endConnection("error", `Could not play assistant audio: ${String(error)}`);
+          }
+          return;
+        }
+        if (
+          event.type === "audio.stop" &&
+          playbackRef.current &&
+          (event.id === playbackRef.current.id ||
+            (event.id === undefined && playbackRef.current.legacy))
+        ) {
+          stopTurn(event.reason);
+          return;
+        }
+        if (
+          event.type === "speech" &&
+          event.active === true &&
+          playbackRef.current?.legacy
+        ) {
+          // Older relays stop tracking playback when encoding ends. Their VAD
+          // event still lets us interrupt audio buffered on the phone.
+          stopTurn("barge-in");
+          return;
+        }
+        if (event.type === "error" || event.type === "relay.closed") {
+          endConnection(
+            "error",
+            String(event.message ?? event.reason ?? "Relay disconnected"),
+          );
+        }
+      };
+    } catch (error) {
+      if (connectionEpoch === connectionEpochRef.current) {
+        endConnection(
+          "error",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }, [
+    endConnection,
+    metric,
+    mode,
+    phase,
+    player,
+    startMic,
+    stopMic,
+    stopPlayback,
+    stopTurn,
+    upsertTranscript,
+  ]);
+
+  useEffect(() => {
+    const subscription = player.addListener("playbackStatusUpdate", (status) => {
+      const playback = playbackRef.current;
+      if (
+        !playback ||
+        playback.connectionEpoch !== connectionEpochRef.current ||
+        !relayReadyRef.current
+      ) {
+        return;
+      }
+      // Events can be queued from the preceding source. Check the live public
+      // player properties before treating one as playback or completion.
+      const playing = player.playing;
+      const buffering = player.isBuffering;
+      playingRef.current = playing && !buffering;
+      if (playingRef.current && !playback.observedPlaying) {
+        playback.observedPlaying = true;
+        metric("playback-observed-start", playback.id);
+      }
+
+      const finished = status.didJustFinish && !playing && !buffering &&
+        (playback.observedPlaying || player.currentTime > 0);
+      const failed = status.error && !playing && !buffering && !player.isLoaded;
+      if (failed || finished) {
+        if (failed) {
+          setDetail(`Player error: ${status.error}`);
+        }
+        metric(failed ? "playback-error" : "playback-finished", playback.id);
+        stopPlayback();
+        if (mode === "half-duplex") {
+          void startMic();
+        } else {
+          setPhase("listening");
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, [metric, mode, player, startMic, stopPlayback]);
+
+  // Native tabs retain the presentation, just like the RNAA tabs. Blur ends
+  // the call without unmounting the UI or recreating native objects on return.
+  useFocusEffect(
+    useCallback(() => {
+      const timer = setInterval(
+        () => setDiagnostics({ ...diagnosticsRef.current }),
+        1_000,
+      );
+      return () => {
+        clearInterval(timer);
+        endConnection("idle");
+      };
+    }, [endConnection]),
+  );
+
+  const sendText = useCallback(() => {
+    const text = draft.trim();
+    if (phase === "listening" && text && send({ type: "text", text })) {
+      setDraft("");
+    }
+  }, [draft, phase, send]);
+
+  let statusLabel: string;
+  if (phase === "assistant") {
+    statusLabel = mode === "half-duplex"
+      ? "Assistant speaking — microphone paused"
+      : "Assistant reply — microphone streaming";
+  } else if (phase === "listening") {
+    statusLabel = isStreaming ? "Listening — microphone streaming" : "Starting microphone";
+  } else {
+    statusLabel = phase[0].toUpperCase() + phase.slice(1);
+  }
+
+  let assistantStatus = "stopped";
+  if (phase === "assistant") {
+    if (playerStatus.isBuffering) {
+      assistantStatus = "buffering";
+    } else {
+      assistantStatus = playerStatus.playing ? "playing" : "loading";
+    }
+  }
+
+  const canSend = phase === "listening" && Boolean(draft.trim());
+  const canDisconnect = phase !== "idle" && phase !== "error";
+
+  return (
+    <>
+      <WorkshopHeading
+        title={
+          mode === "half-duplex" ? "Expo Audio half duplex" : "Stock Expo Audio full duplex"
+        }
+        description={
+          mode === "half-duplex"
+            ? "Speakerphone fallback: capture pauses for every assistant reply. No barge-in."
+            : "Experimental loudspeaker chat: microphone stays on during replies. Observe echo and spoken interruptions."
+        }
+      />
+      <View style={workshopStyles.statusRow}>
+        <View
+          style={[workshopStyles.statusDot, { backgroundColor: PHASE_COLOR[phase] }]}
+        />
+        <Text style={[workshopStyles.statusText, { color: colors.text }]}>
+          {statusLabel}
+        </Text>
+      </View>
+      {detail ? <Text style={styles.warning}>{detail}</Text> : null}
+      <ScrollView
+        style={styles.transcript}
+        contentContainerStyle={styles.transcriptContent}
+      >
+        {entries.length === 0 ? (
+          <Text style={[styles.muted, { color: colors.muted }]}>
+            Connect, then speak a turn.
+          </Text>
+        ) : (
+          entries.map((entry) => (
+            <View key={entry.id} style={styles.entry}>
+              <Text style={[styles.role, { color: colors.muted }]}>
+                {entry.role === "user" ? "You" : "Assistant"}
+              </Text>
+              <Text style={[styles.entryText, { color: colors.text }]}>
+                {entry.text}
+              </Text>
+            </View>
+          ))
+        )}
+      </ScrollView>
+      <View style={workshopStyles.composer}>
+        <TextInput
+          value={draft}
+          onChangeText={setDraft}
+          onSubmitEditing={sendText}
+          editable={phase === "listening"}
+          placeholder="Type a message"
+          placeholderTextColor={colors.placeholder}
+          style={[
+            workshopStyles.input,
+            { color: colors.text, borderColor: colors.border, backgroundColor: colors.field },
+          ]}
+        />
+        <Pressable
+          style={[
+            workshopStyles.sendButton,
+            !canSend && workshopStyles.buttonDisabled,
+          ]}
+          onPress={sendText}
+          disabled={!canSend}
+        >
+          <Text style={workshopStyles.sendLabel}>Send</Text>
+        </Pressable>
+      </View>
+      <View style={[styles.diagnostics, { backgroundColor: colors.panel }]}>
+        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+          Relay: {resolveVoiceSocketUrl()}
+        </Text>
+        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+          speaker route · capture: {captureInfo}
+        </Text>
+        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+          Mic: {isStreaming ? "streaming" : "stopped"} · Assistant: {assistantStatus}
+        </Text>
+        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+          Buffers sent during playback: {diagnostics.sentDuringPlayback}
+          {" · Relay received: "}{diagnostics.receivedMicBuffers ?? "--"}
+        </Text>
+        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+          Interruptions: {diagnostics.interruptions} · Player timing is approximate, not acoustic output.
+        </Text>
+      </View>
+      <Pressable
+        style={[
+          workshopStyles.callButton,
+          canDisconnect && workshopStyles.callButtonStop,
+        ]}
+        onPress={() => void connect()}
+      >
+        <Text style={workshopStyles.callLabel}>
+          {canDisconnect ? "Disconnect" : "Connect"}
+        </Text>
+      </Pressable>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  warning: { color: "#FF9F0A", fontSize: 13 },
+  muted: { fontSize: 12, lineHeight: 17 },
+  transcript: { flex: 1 },
+  transcriptContent: { gap: 12, paddingVertical: 8 },
+  entry: { gap: 2 },
+  role: { fontSize: 12, fontWeight: "600" },
+  entryText: { fontSize: 16 },
+  diagnostics: { borderRadius: 8, gap: 2, padding: 8 },
+  diagnosticText: { fontSize: 11, lineHeight: 16 },
+});

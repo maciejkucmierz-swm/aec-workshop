@@ -1,5 +1,7 @@
+import realtimeConfig from "../../shared/realtime-config.json";
+
 /** OpenAI Realtime uses 16-bit mono PCM at 24 kHz in both directions. */
-export const REALTIME_SAMPLE_RATE = 24_000;
+export const REALTIME_SAMPLE_RATE = realtimeConfig.session.audio.input.format.rate;
 
 const BASE64_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

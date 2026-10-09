@@ -4,12 +4,24 @@ An Expo SDK 57 / React Native 0.86 workshop for comparing voice-agent audio path
 
 ## What it compares
 
-- **Patched Voice** — RNAA communication capture and voice output, including the platform voice-processing path where available.
-- **Upstream Voice** — the same RNAA app flow with upstream stream defaults.
-- **Media Voice** — communication capture with Android media-style assistant output.
-- **Expo Audio** — stock Expo Audio half duplex and an Android `mic` versus `voice_communication` recorder diagnostic.
+- **Patched** — RNAA communication capture and voice output, including the platform voice-processing path where available.
+- **Upstream** — the same RNAA app flow with upstream stream defaults.
+- **Media** — communication capture with Android media-style assistant output.
+- **Expo** — stock Expo Audio half duplex and an Android `mic` versus `voice_communication` recorder diagnostic.
+- **Duplex** — Android stock Expo Audio microphone streaming throughout progressive AAC assistant playback, with spoken interruption and live diagnostics.
 
 Results are device-specific evidence, not a guarantee of AEC performance across routes, volumes, rooms, or devices.
+
+### Full-duplex comparison on Android
+
+Keep loudspeaker volume, phone position, network, and prompt fixed. Run three trials each in Patched, Expo (half duplex), and Duplex:
+
+1. Ask the assistant to count slowly to twenty, then stay silent. Note whether its speech appears as a **You** transcript or causes an interruption.
+2. Interrupt with a different question while it speaks. Repeat late in the reply, when generation may have finished but playback is still buffered. Listen for a prompt stop and any stale replay.
+3. In Duplex, check that **Buffers sent during playback** and **Relay received** increase together while the assistant is audible. The former counts buffers sent during observed playback; the latter counts all microphone buffers accepted by the relay for this connection.
+4. Disconnect/reconnect and change tabs during a reply. Capture and playback should stop when leaving. Half duplex should pause capture for every reply; its playback buffer count should remain zero.
+
+Playback replacement, observed start, completion, and interruption timestamps appear in Metro and relay logs. Player timing is approximate and does not measure acoustic output. Record actual observations; a VAD interruption alone does not prove echo, and this experiment does not establish universal Expo AEC support or failure. iOS and web execution of the Duplex tab are deferred.
 
 ## Prerequisites
 
@@ -34,6 +46,8 @@ Run the local relay and Metro in separate terminals:
 ```bash
 bun run token-server
 ```
+
+Restart this process after relay code changes. Metro refreshes the app, not the relay. The Expo agent accepts older audio messages too, but relay buffer counts require the updated relay; `--` means no count has been received.
 
 ```bash
 bun run start

@@ -7,14 +7,15 @@ import path from "node:path";
 import dotenv from "dotenv";
 import express from "express";
 import { WebSocket, WebSocketServer } from "ws";
+import realtimeConfig from "../shared/realtime-config.json" with { type: "json" };
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 dotenv.config({ path: path.join(rootDir, ".env.local"), quiet: true });
 
 const PORT = Number(process.env.TOKEN_SERVER_PORT ?? 8787);
-const MODEL = "gpt-realtime-2.1-mini";
+const MODEL = realtimeConfig.model;
 const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${MODEL}`;
-const SAMPLE_RATE = 24_000;
+const SAMPLE_RATE = realtimeConfig.session.audio.input.format.rate;
 const STREAM_TTL_MS = 30_000;
 const DIAGNOSTIC_PROBE_TTL_MS = 60_000;
 const DIAGNOSTIC_RECORDING_MAX_BYTES = 2 * 1024 * 1024;
@@ -31,28 +32,9 @@ if (!ffmpegAvailable) {
 }
 
 const sessionConfig = {
-  type: "realtime",
-  output_modalities: ["audio"],
+  ...realtimeConfig.session,
   instructions:
     "You are a concise voice assistant in a technical demo. Keep answers to one or two short sentences unless asked for detail.",
-  audio: {
-    input: {
-      format: { type: "audio/pcm", rate: SAMPLE_RATE },
-      transcription: { model: "gpt-4o-mini-transcribe" },
-      turn_detection: {
-        type: "server_vad",
-        threshold: 0.5,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 500,
-        create_response: false,
-        interrupt_response: true,
-      },
-    },
-    output: {
-      format: { type: "audio/pcm", rate: SAMPLE_RATE },
-      voice: "marin",
-    },
-  },
 };
 
 const app = express();
@@ -366,19 +348,23 @@ function openRealtime(client, request) {
     request,
     realtime: null,
     activeStream: null,
+    playbackStreamId: null,
     activeResponseId: null,
+    receivedMicBuffers: 0,
     cancelledResponseIds: new Set(),
     closed: false,
   };
 
   const stopActiveStream = (reason) => {
     const stream = relay.activeStream;
-    if (!stream) {
-      return;
-    }
+    const id = relay.playbackStreamId;
     relay.activeStream = null;
-    stream.cancel();
-    send(client, { type: "audio.stop", reason, at: Date.now() });
+    relay.playbackStreamId = null;
+    stream?.cancel();
+    // Encoding can finish before the phone drains its playback buffer.
+    if (id) {
+      send(client, { type: "audio.stop", id, reason, at: Date.now() });
+    }
   };
 
   const createAudioStream = (responseId = null) => {
@@ -393,8 +379,10 @@ function openRealtime(client, request) {
     stream.responseId = responseId;
     streams.set(stream.id, stream);
     relay.activeStream = stream;
+    relay.playbackStreamId = stream.id;
     send(client, {
       type: "audio.start",
+      id: stream.id,
       url: `http://${request.headers.host}/voice-stream/${stream.id}.aac`,
       at: Date.now(),
     });
@@ -408,6 +396,11 @@ function openRealtime(client, request) {
     },
   });
   relay.realtime = realtime;
+
+  const statsTimer = setInterval(() => {
+    send(client, { type: "relay.stats", receivedMicBuffers: relay.receivedMicBuffers });
+  }, 1_000);
+  statsTimer.unref();
 
   realtime.on("open", () => {
     realtime.send(JSON.stringify({ type: "session.update", session: sessionConfig }));
@@ -543,6 +536,7 @@ function openRealtime(client, request) {
       const pcm = Buffer.from(message.data, "base64");
       if (pcm.length > 0 && pcm.length <= 64 * 1024 && realtime.readyState === WebSocket.OPEN) {
         realtime.send(JSON.stringify({ type: "input_audio_buffer.append", audio: message.data }));
+        relay.receivedMicBuffers += 1;
       }
       return;
     }
@@ -565,12 +559,13 @@ function openRealtime(client, request) {
 
     if (message.type === "metric") {
       const serverAt = Date.now();
-      console.log(`relay metric ${String(message.name)} client=${String(message.at)} server=${serverAt}`);
+      console.log(`relay metric ${String(message.name)} turn=${String(message.id ?? "--")} client=${String(message.at)} server=${serverAt}`);
     }
   });
 
   client.on("close", () => {
     relay.closed = true;
+    clearInterval(statsTimer);
     stopActiveStream("client-disconnect");
     realtime.close();
   });

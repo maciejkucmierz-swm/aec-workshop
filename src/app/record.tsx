@@ -101,8 +101,7 @@ export function VoiceScreen({
   }, []);
 
   const [session] = useState(() => {
-    let createdSession: RealtimeSession;
-    createdSession = new RealtimeSession({
+    return new RealtimeSession({
       onStatus: (nextStatus, nextDetail) => {
         setStatus(nextStatus);
         setDetail(nextDetail ?? null);
@@ -120,7 +119,6 @@ export function VoiceScreen({
       onWarning: setWarning,
       audioStreamProfile,
     });
-    return createdSession;
   });
 
   // Synchronize the selected interaction mode once the socket is ready. This
@@ -166,13 +164,6 @@ export function VoiceScreen({
     setWarning(null);
     void session.connect();
   }, [isBusy, isLive, session]);
-
-  const selectMode = useCallback(
-    (next: Mode) => {
-      setMode(next);
-    },
-    []
-  );
 
   const sendDraft = useCallback(() => {
     session.sendText(draft);
@@ -383,7 +374,7 @@ export function VoiceScreen({
             <Pressable
               key={option}
               style={[workshopStyles.modeButton, selected && workshopStyles.modeButtonSelected]}
-              onPress={() => selectMode(option)}
+              onPress={() => setMode(option)}
             >
               <Text
                 style={[
