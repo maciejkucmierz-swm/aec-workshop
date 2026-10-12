@@ -7,10 +7,10 @@ export default function ExpoDuplexScreen() {
   return (
     <WorkshopSurface>
       <View style={workshopStyles.content}>
-        {Platform.OS !== "android" ? (
+        {Platform.OS === "web" ? (
           <WorkshopHeading
             title="Stock Expo Audio full duplex"
-            description="This loudspeaker experiment targets Android first. iOS and web execution are deferred."
+            description="This stock Expo Audio experiment targets Android and iPhone. Web execution is deferred."
           />
         ) : (
           <ExpoVoiceAgent mode="full-duplex" />

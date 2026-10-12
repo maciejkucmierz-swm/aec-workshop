@@ -43,17 +43,6 @@ function applyAudioStreamProfile(profile: AudioStreamProfile): void {
 let activeStreamProfile: AudioStreamProfile = "voice-processing";
 let audioContext: AudioContext | null = null;
 let recorder: AudioRecorder | null = null;
-let lifecycleTail: Promise<void> = Promise.resolve();
-
-/** Serializes audio ownership across the native comparison tabs. */
-export function serializeVoiceLifecycle<T>(operation: () => Promise<T>): Promise<T> {
-  const result = lifecycleTail.then(operation, operation);
-  lifecycleTail = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
-}
 
 async function selectAudioStreamProfile(profile: AudioStreamProfile): Promise<void> {
   if (profile === activeStreamProfile) {
@@ -105,7 +94,7 @@ const ROUTE_RECOVERY_AFTER_MS = 2_000;
 const ROUTE_POLL_INTERVAL_MS = 250;
 
 let voiceRoute: AudioRoute = "speaker";
-/** The communication device Android last confirmed. */
+/** The actual communication output last reported by the platform. */
 let routedDevice: string | null = null;
 
 export function getVoiceRoute(): AudioRoute {
@@ -128,7 +117,7 @@ function wait(ms: number): Promise<void> {
  * not settled, clear the failed selection and request it again, then give the
  * platform no more than 30 seconds to confirm the route.
  *
- * @returns The device Android settled on, or null when there is no
+ * @returns The actual output, or null when there is no
  * active communication session to route.
  */
 export async function applyVoiceRoute(
@@ -136,8 +125,14 @@ export async function applyVoiceRoute(
 ): Promise<string | null> {
   voiceRoute = route;
 
-  if (Platform.OS !== "android" || !communicationModeActive) {
+  if (!communicationModeActive) {
     return null;
+  }
+
+  if (Platform.OS === "ios") {
+    await AudioManager.setCommunicationDevice(route);
+    routedDevice = await AudioManager.getCommunicationDevice();
+    return routedDevice;
   }
 
   const wanted = route;
@@ -197,7 +192,7 @@ export async function activateVoiceSession(
     AudioManager.setAudioSessionOptions({
       iosCategory: "playAndRecord",
       iosMode: "voiceChat",
-      iosOptions: ["defaultToSpeaker", "allowBluetoothHFP"],
+      iosOptions: ["allowBluetoothHFP"],
     });
 
     const permission = await AudioManager.requestRecordingPermissions();
@@ -207,16 +202,20 @@ export async function activateVoiceSession(
 
     await AudioManager.setAudioSessionActivity(true);
     audioSessionActivated = true;
-    communicationModeActive = Platform.OS === "android";
+    communicationModeActive = Platform.OS === "android" || Platform.OS === "ios";
 
-    // Activation selects speaker by default. Reassert the user's current
-    // choice and verify the route before starting either media direction.
+    // Do not use defaultToSpeaker: clearing a speaker override must restore
+    // the receiver. Apply the user's selection to the active session instead.
     const selected = await applyVoiceRoute(voiceRoute);
-    if (Platform.OS === "android" && selected !== voiceRoute) {
+    if (communicationModeActive && selected !== voiceRoute) {
       throw new Error(`Could not select ${voiceRoute} for communication audio`);
     }
 
     await getAudioContext().resume();
+    if (Platform.OS === "ios") {
+      // Enabling Voice Processing I/O can change the engine's output route.
+      await applyVoiceRoute(voiceRoute);
+    }
 
     // A focus-loss callback can land while the audio graph is coming up. Check
     // once more after resume so no capture or playback starts in that window.

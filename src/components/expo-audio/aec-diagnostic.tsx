@@ -11,6 +11,7 @@ import {
 } from "expo-audio";
 
 import { resolveServerBaseUrl } from "@/lib/token-url";
+import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
 import {
   useWorkshopColors,
   WorkshopHeading,
@@ -66,7 +67,7 @@ export function AecDiagnostic({
       return captureCleanupRef.current;
     }
 
-    const cleanup = (async () => {
+    const cleanup = serializeAudioLifecycle(async () => {
       player.pause();
       if (recorder.isRecording) {
         try {
@@ -82,7 +83,7 @@ export function AecDiagnostic({
       if (recordingFile?.exists) {
         recordingFile.delete();
       }
-    })();
+    });
 
     captureCleanupRef.current = cleanup;
     const clearCleanup = () => {
@@ -136,22 +137,28 @@ export function AecDiagnostic({
       };
       let recordingFile: File | null = null;
       try {
-        await recorder.prepareToRecordAsync({
-          ...RecordingPresets.HIGH_QUALITY,
-          numberOfChannels: 1,
-          bitRate: 64_000,
-          android: {
-            ...RecordingPresets.HIGH_QUALITY.android,
-            audioSource: source,
-          },
+        await serializeAudioLifecycle(async () => {
+          ensureCurrentRun(runEpoch);
+          await recorder.prepareToRecordAsync({
+            ...RecordingPresets.HIGH_QUALITY,
+            numberOfChannels: 1,
+            bitRate: 64_000,
+            android: {
+              ...RecordingPresets.HIGH_QUALITY.android,
+              audioSource: source,
+            },
+          });
+          ensureCurrentRun(runEpoch);
+          recorder.record();
+          player.replace({ uri: probe.url });
+          player.play();
         });
-        ensureCurrentRun(runEpoch);
-        recorder.record();
-        player.replace({ uri: probe.url });
-        player.play();
         await new Promise((resolve) => setTimeout(resolve, probe.durationMs + 2_500));
         ensureCurrentRun(runEpoch);
-        await recorder.stop();
+        await serializeAudioLifecycle(async () => {
+          ensureCurrentRun(runEpoch);
+          await recorder.stop();
+        });
         ensureCurrentRun(runEpoch);
         if (!recorder.uri) {
           throw new Error("Expo Audio did not return a diagnostic recording URI");
@@ -195,11 +202,14 @@ export function AecDiagnostic({
       if (!permission.granted) {
         throw new Error("Microphone permission was denied");
       }
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
-        interruptionMode: "doNotMix",
-        shouldRouteThroughEarpiece: false,
+      await serializeAudioLifecycle(async () => {
+        ensureCurrentRun(runEpoch);
+        await setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
+          interruptionMode: "doNotMix",
+          shouldRouteThroughEarpiece: false,
+        });
       });
       ensureCurrentRun(runEpoch);
       const nextResults: DiagnosticResult[] = [];

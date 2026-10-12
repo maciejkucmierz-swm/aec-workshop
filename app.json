@@ -9,7 +9,13 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "com.anonymous.aecworkshop"
+      "bundleIdentifier": "com.anonymous.aecworkshop",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Connect to your computer's local voice relay for workshop conversations and audio diagnostics.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {

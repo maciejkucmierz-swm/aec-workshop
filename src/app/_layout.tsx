@@ -1,6 +1,6 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from "expo-router";
 import { NativeTabs } from "expo-router/unstable-native-tabs";
-import { useColorScheme } from "react-native";
+import { Platform, useColorScheme } from "react-native";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -25,7 +25,7 @@ export default function RootLayout() {
           />
         </NativeTabs.Trigger>
 
-        <NativeTabs.Trigger name="record-media-output">
+        <NativeTabs.Trigger name="record-media-output" hidden={Platform.OS === "ios"}>
           <NativeTabs.Trigger.Label>Media</NativeTabs.Trigger.Label>
           <NativeTabs.Trigger.Icon
             sf={{ default: "speaker.wave.2", selected: "speaker.wave.2.fill" }}

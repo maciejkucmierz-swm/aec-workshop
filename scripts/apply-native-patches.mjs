@@ -56,6 +56,13 @@ const PATCHES = [
     marker: "activateCommunicationSession",
     markerFile: "android/src/main/java/com/swmansion/audioapi/system/MediaSessionManager.kt",
   },
+  // Incremental: the communication-session patch above originally shipped iOS stubs.
+  {
+    patch: "patches/react-native-audio-api-ios-communication-routing+0.13.3.patch",
+    target: "node_modules/react-native-audio-api",
+    marker: "AEC workshop iOS communication routing",
+    markerFile: "ios/audioapi/ios/AudioAPIModule.mm",
+  },
 ];
 
 const packageJson = path.join(AUDIO_API_TARGET, "package.json");

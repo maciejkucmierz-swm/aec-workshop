@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useFocusEffect } from "expo-router";
 import {
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,12 +12,14 @@ import {
 import {
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
+  setIsAudioActiveAsync,
   useAudioPlayer,
   useAudioPlayerStatus,
   useAudioStream,
 } from "expo-audio";
 
 import { encodeBase64, REALTIME_SAMPLE_RATE } from "@/lib/pcm";
+import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
 import { resolveVoiceSocketUrl } from "@/lib/token-url";
 import {
   WORKSHOP_STATUS_COLOR,
@@ -39,6 +42,12 @@ const EMPTY_DIAGNOSTICS: Diagnostics = {
   receivedMicBuffers: null,
   interruptions: 0,
 };
+
+const SPEAKER_MODE = {
+  playsInSilentMode: true,
+  interruptionMode: "doNotMix",
+  shouldRouteThroughEarpiece: false,
+} as const;
 
 const PHASE_COLOR: Record<RelayPhase, string> = {
   idle: WORKSHOP_STATUS_COLOR.idle,
@@ -78,7 +87,10 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   const connectionEpochRef = useRef(0);
   const relayReadyRef = useRef(false);
   const micEnabledRef = useRef(false);
-  const micTaskRef = useRef<Promise<void>>(Promise.resolve());
+  const audioSessionOwnedRef = useRef(false);
+  // Includes an in-flight start, so queued teardown also cleans up partial setup.
+  const micStartedRef = useRef(false);
+  const lastMicBufferAtRef = useRef<number | null>(null);
   const firstMicFrameRef = useRef(true);
   const diagnosticsRef = useRef({ ...EMPTY_DIAGNOSTICS });
   const playbackRef = useRef<{
@@ -86,6 +98,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     legacy: boolean;
     connectionEpoch: number;
     observedPlaying: boolean;
+    started: boolean;
   } | null>(null);
   const playingRef = useRef(false);
   const [phase, setPhase] = useState<RelayPhase>("idle");
@@ -98,6 +111,9 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   const player = useAudioPlayer(null, {
     downloadFirst: false,
     updateInterval: 100,
+    // Pausing/finishing must not schedule Expo's delayed iOS deactivation:
+    // it would stop our mic or deactivate the next tab after a blur.
+    keepAudioSessionActive: Platform.OS === "ios",
   });
   const playerStatus = useAudioPlayerStatus(player);
 
@@ -126,6 +142,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       if (!relayReadyRef.current || !micEnabledRef.current || channels !== 1) {
         return;
       }
+      lastMicBufferAtRef.current = Date.now();
       const pcm = resampleToRealtime(data, sampleRate);
       if (firstMicFrameRef.current) {
         firstMicFrameRef.current = false;
@@ -166,17 +183,20 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
 
   const stopMic = useCallback(() => {
     micEnabledRef.current = false;
-    const stop = () => {
+    lastMicBufferAtRef.current = null;
+    return serializeAudioLifecycle(() => {
+      if (!micStartedRef.current) {
+        return;
+      }
       try {
         stream.stop();
-      } catch {
-        // Expo Audio may already have released the stream.
+      } finally {
+        micStartedRef.current = false;
       }
-    };
-    stop();
-    // A pending native start may finish after the synchronous stop. Queue a
-    // final stop before allowing the next connection to start this stream.
-    micTaskRef.current = micTaskRef.current.then(stop, stop);
+    }).catch((error) => {
+      // Expo Audio may already have released the stream.
+      console.warn(`Expo microphone cleanup failed: ${String(error)}`);
+    });
   }, [stream]);
 
   const stopPlayback = useCallback(() => {
@@ -195,8 +215,19 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       relayReadyRef.current = false;
       const socket = socketRef.current;
       socketRef.current = null;
-      stopMic();
       stopPlayback();
+      void stopMic();
+      void serializeAudioLifecycle(async () => {
+        if (!audioSessionOwnedRef.current) {
+          return;
+        }
+        audioSessionOwnedRef.current = false;
+        if (Platform.OS === "ios") {
+          await setIsAudioActiveAsync(false);
+        }
+      }).catch((error) => {
+        console.warn(`Expo audio session cleanup failed: ${String(error)}`);
+      });
       socket?.close();
       if (nextDetail !== undefined) {
         setDetail(nextDetail);
@@ -215,30 +246,44 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     const connectionEpoch = connectionEpochRef.current;
     micEnabledRef.current = true;
     firstMicFrameRef.current = true;
-    micTaskRef.current = micTaskRef.current
-      .then(async () => {
-        if (connectionEpoch !== connectionEpochRef.current || !micEnabledRef.current) {
+    const isCurrentCapture = () =>
+      connectionEpoch === connectionEpochRef.current &&
+      relayReadyRef.current &&
+      micEnabledRef.current &&
+      (mode === "full-duplex" || playbackRef.current === null);
+    return serializeAudioLifecycle(async () => {
+      if (!isCurrentCapture()) {
+        return;
+      }
+      audioSessionOwnedRef.current = true;
+      await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: true });
+      if (!isCurrentCapture()) {
+        return;
+      }
+      micStartedRef.current = true;
+      await stream.start();
+      if (!isCurrentCapture()) {
+        stream.stop();
+        micStartedRef.current = false;
+        return;
+      }
+      lastMicBufferAtRef.current = Date.now();
+      if (Platform.OS === "ios" && mode === "full-duplex") {
+        // SDK 57's iOS stream starts in .record/.measurement. Restore the
+        // public play-and-record speaker configuration without stopping it.
+        await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: true });
+        if (!isCurrentCapture()) {
           return;
         }
-        await stream.start();
-        if (
-          connectionEpoch !== connectionEpochRef.current ||
-          !relayReadyRef.current ||
-          !micEnabledRef.current
-        ) {
-          stream.stop();
-          return;
-        }
-        setPhase(playbackRef.current ? "assistant" : "listening");
-        metric("mic-resumed");
-      })
-      .catch((error) => {
-        if (connectionEpoch === connectionEpochRef.current) {
-          endConnection("error", `Could not start Expo Audio stream: ${String(error)}`);
-        }
-      });
-    return micTaskRef.current;
-  }, [endConnection, metric, stream]);
+      }
+      setPhase(playbackRef.current ? "assistant" : "listening");
+      metric("mic-resumed");
+    }).catch((error) => {
+      if (connectionEpoch === connectionEpochRef.current) {
+        endConnection("error", `Could not start Expo Audio stream: ${String(error)}`);
+      }
+    });
+  }, [endConnection, metric, mode, stream]);
 
   const stopTurn = useCallback(
     (reason: unknown) => {
@@ -284,15 +329,6 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       }
       if (!permission.granted) {
         throw new Error("Microphone permission was denied");
-      }
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
-        interruptionMode: "doNotMix",
-        shouldRouteThroughEarpiece: false,
-      });
-      if (connectionEpoch !== connectionEpochRef.current) {
-        return;
       }
       const socket = new WebSocket(resolveVoiceSocketUrl());
       if (connectionEpoch !== connectionEpochRef.current) {
@@ -360,24 +396,43 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
           const legacy = typeof event.id !== "string";
           const id = typeof event.id === "string" ? event.id : event.url;
           if (mode === "half-duplex") {
-            stopMic();
+            void stopMic();
             metric("mic-paused", id);
           }
           stopPlayback();
-          playbackRef.current = {
+          const playback = {
             id,
             legacy,
             connectionEpoch,
             observedPlaying: false,
+            started: false,
           };
+          playbackRef.current = playback;
           setPhase("assistant");
-          try {
+          const url = event.url;
+          const isCurrentTurn = () => isCurrentSocket() &&
+            relayReadyRef.current && playbackRef.current === playback;
+          // Half-duplex stop is already queued. Wait for native cleanup before
+          // switching iOS to playback-only; never queue the HTTP stream itself.
+          void serializeAudioLifecycle(async () => {
+            if (!isCurrentTurn()) {
+              return;
+            }
+            if (Platform.OS === "ios" && mode === "half-duplex") {
+              await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: false });
+              if (!isCurrentTurn()) {
+                return;
+              }
+            }
             metric("playback-replaced", id);
-            player.replace({ uri: event.url });
+            player.replace({ uri: url });
+            playback.started = true;
             player.play();
-          } catch (error) {
-            endConnection("error", `Could not play assistant audio: ${String(error)}`);
-          }
+          }).catch((error) => {
+            if (isCurrentTurn()) {
+              endConnection("error", `Could not play assistant audio: ${String(error)}`);
+            }
+          });
           return;
         }
         if (
@@ -432,6 +487,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       const playback = playbackRef.current;
       if (
         !playback ||
+        !playback.started ||
         playback.connectionEpoch !== connectionEpochRef.current ||
         !relayReadyRef.current
       ) {
@@ -470,10 +526,19 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   // the call without unmounting the UI or recreating native objects on return.
   useFocusEffect(
     useCallback(() => {
-      const timer = setInterval(
-        () => setDiagnostics({ ...diagnosticsRef.current }),
-        1_000,
-      );
+      const timer = setInterval(() => {
+        setDiagnostics({ ...diagnosticsRef.current });
+        if (
+          relayReadyRef.current && micEnabledRef.current &&
+          lastMicBufferAtRef.current !== null &&
+          Date.now() - lastMicBufferAtRef.current >= 3_000
+        ) {
+          endConnection(
+            "error",
+            "Expo Audio capture failed: no microphone buffers for 3 seconds while capture was expected. Session reconfiguration may have stopped capture; no half-duplex fallback was applied.",
+          );
+        }
+      }, 1_000);
       return () => {
         clearInterval(timer);
         endConnection("idle");
@@ -520,7 +585,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
         description={
           mode === "half-duplex"
             ? "Speakerphone fallback: capture pauses for every assistant reply. No barge-in."
-            : "Experimental loudspeaker chat: microphone stays on during replies. Observe echo and spoken interruptions."
+            : "Experimental Android/iPhone loudspeaker chat. Capture stays on during replies; simultaneous audio and echo behavior require device validation."
         }
       />
       <View style={workshopStyles.statusRow}>

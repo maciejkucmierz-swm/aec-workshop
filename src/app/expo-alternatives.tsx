@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Platform, Pressable, Text, View } from "react-native";
 
 import { AecDiagnostic } from "@/components/expo-audio/aec-diagnostic";
 import { ExpoVoiceAgent } from "@/components/expo-audio/voice-agent";
@@ -25,27 +25,29 @@ export default function ExpoAlternativesScreen() {
   return (
     <WorkshopSurface>
       <View style={workshopStyles.content}>
-        <View style={[workshopStyles.modeRow, { borderColor: colors.border }]}>
-          {(["half-duplex", "aec-diagnostic"] as const).map((option) => (
-            <Pressable
-              key={option}
-              style={[
-                workshopStyles.modeButton,
-                mode === option && workshopStyles.modeButtonSelected,
-              ]}
-              onPress={() => setMode(option)}
-            >
-              <Text
+        {Platform.OS === "android" ? (
+          <View style={[workshopStyles.modeRow, { borderColor: colors.border }]}>
+            {(["half-duplex", "aec-diagnostic"] as const).map((option) => (
+              <Pressable
+                key={option}
                 style={[
-                  workshopStyles.modeLabel,
-                  { color: mode === option ? "white" : colors.text },
+                  workshopStyles.modeButton,
+                  mode === option && workshopStyles.modeButtonSelected,
                 ]}
+                onPress={() => setMode(option)}
               >
-                {option === "half-duplex" ? "Half duplex" : "AEC diagnostic"}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
+                <Text
+                  style={[
+                    workshopStyles.modeLabel,
+                    { color: mode === option ? "white" : colors.text },
+                  ]}
+                >
+                  {option === "half-duplex" ? "Half duplex" : "AEC diagnostic"}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
         {mode === "half-duplex" ? <ExpoVoiceAgent mode="half-duplex" /> : null}
         {mode === "aec-diagnostic" ? (
           <AecDiagnostic

@@ -16,6 +16,7 @@ import {
   getVoiceRoute,
   type AudioStreamProfile,
 } from "@/lib/audio-engine";
+import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
 import {
   RealtimeSession,
   type SessionDiagnostics,
@@ -53,7 +54,7 @@ function formatLeak(db: number | null): string {
   return `${db >= 0 ? "+" : ""}${db.toFixed(1)} dB`;
 }
 
-/** Normalize Android device labels for the diagnostics row. */
+/** Normalize native output labels for the diagnostics row. */
 function formatDevice(device: string | null): string | null {
   return device === null ? null : device.toLowerCase().replace(/_/g, " ");
 }
@@ -81,7 +82,7 @@ export function VoiceScreen({
   const [diagnostics, setDiagnostics] = useState<SessionDiagnostics | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [route, setRoute] = useState<AudioRoute>(getVoiceRoute);
-  /** What Android reports it actually routed to, which can differ from the request. */
+  /** Actual platform output, which can differ from the request. */
   const [routeInfo, setRouteInfo] = useState<string | null>(null);
 
   const scrollRef = useRef<ScrollView>(null);
@@ -175,7 +176,7 @@ export function VoiceScreen({
     setWarning(null);
 
     try {
-      const selected = await applyVoiceRoute(next);
+      const selected = await serializeAudioLifecycle(() => applyVoiceRoute(next));
       if (selected === null) {
         // No live session to route yet; the choice applies on connect.
         setRouteInfo(null);
@@ -186,7 +187,7 @@ export function VoiceScreen({
       const honored = selected === next;
       if (!honored) {
         setWarning(
-          `Android kept ${selected}: the requested communication device was not selected`
+          `The device kept ${selected}: the requested communication output was not selected`
         );
       }
     } catch (error) {

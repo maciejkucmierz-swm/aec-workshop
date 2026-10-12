@@ -3,8 +3,8 @@ import Constants from "expo-constants";
 const DEFAULT_PORT = 8787;
 
 /**
- * The iOS simulator shares localhost with the Mac, but a physical Android device
- * does not. Metro already knows the Mac's LAN address, so reuse that host.
+ * The iOS simulator shares localhost with the Mac, but physical phones do not.
+ * Metro already knows the computer's LAN address, so reuse that host.
  */
 export function resolveServerBaseUrl(): string {
   const override = process.env.EXPO_PUBLIC_TOKEN_URL;

@@ -1,3 +1,4 @@
+import { Platform } from "react-native";
 import {
   AudioManager,
   type AudioBufferQueueSourceNode,
@@ -7,14 +8,16 @@ import {
   CAPTURE_BUFFER_LENGTH,
   REALTIME_SAMPLE_RATE,
   activateVoiceSession,
+  applyVoiceRoute,
   createPlaybackQueue,
   deactivateVoiceSession,
   encodeCaptureChunk,
   getAudioContext,
   getRecorder,
-  serializeVoiceLifecycle,
+  getVoiceRoute,
   type AudioStreamProfile,
 } from "@/lib/audio-engine";
+import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
 import {
   LevelTimeline,
   PlaybackWindow,
@@ -178,8 +181,8 @@ export class RealtimeSession {
   private audioFocusPaused = false;
   private resumeMicAfterFocusGain = false;
   private audioFocusSubscriptions: RemovableSubscription[] = [];
-  /** Serialises native focus events, whose recorder calls are asynchronous. */
-  private focusChangeChain: Promise<void> = Promise.resolve();
+  /** Latest requested mic state; stale native starts cannot override a newer choice. */
+  private micGeneration = 0;
   /** Mic capture is independent of the socket, so typing cannot be interrupted. */
   private capturing = false;
   private playbackErrorReported = false;
@@ -225,7 +228,7 @@ export class RealtimeSession {
       return;
     }
 
-    await serializeVoiceLifecycle(async () => {
+    await serializeAudioLifecycle(async () => {
       if (!this.isCurrentConnection(connectionGeneration)) {
         return;
       }
@@ -252,6 +255,9 @@ export class RealtimeSession {
         // Subscribe before the native session requests focus so a loss during
         // setup cannot race the first capture or playback buffer.
         this.subscribeAudioFocus();
+        if (Platform.OS === "ios") {
+          AudioManager.observeAudioInterruptions(true);
+        }
         log("key received, activating audio session");
         await activateVoiceSession(this.handlers.audioStreamProfile);
         if (!this.isCurrentConnection(connectionGeneration)) {
@@ -333,11 +339,14 @@ export class RealtimeSession {
     log("disconnect requested");
     this.active = false;
     const connectionGeneration = ++this.connectionGeneration;
+    this.micGeneration += 1;
+    this.capturing = false;
+    this.invalidatePlayback();
     // Keep the button disabled until native teardown releases shared audio.
     this.handlers.onSpeechActivity(false);
     this.handlers.onMicState(false);
     this.handlers.onStatus("disconnecting");
-    await serializeVoiceLifecycle(() => this.teardown());
+    await serializeAudioLifecycle(() => this.teardown());
     if (this.connectionGeneration === connectionGeneration && !this.active) {
       this.handlers.onStatus("idle");
     }
@@ -372,6 +381,9 @@ export class RealtimeSession {
     this.socket = null;
 
     if (this.ownsAudioSession) {
+      if (Platform.OS === "ios") {
+        AudioManager.observeAudioInterruptions(false);
+      }
       this.capturing = false;
       await this.stopRecorder();
       this.stopPlayback();
@@ -419,6 +431,19 @@ export class RealtimeSession {
     if (this.capturing || !this.active || !this.ownsAudioSession) {
       return;
     }
+    const generation = this.connectionGeneration;
+    const micGeneration = ++this.micGeneration;
+    await serializeAudioLifecycle(() => this.startMicOwned(generation, micGeneration));
+  }
+
+  /** Called only while holding the shared native lifecycle queue. */
+  private async startMicOwned(generation: number, micGeneration: number): Promise<void> {
+    if (!this.isCurrentConnection(generation) || micGeneration !== this.micGeneration) {
+      return;
+    }
+    if (this.capturing || !this.active || !this.ownsAudioSession) {
+      return;
+    }
 
     if (this.audioFocusPaused) {
       this.handlers.onWarning("Voice is paused while another app has audio focus");
@@ -436,6 +461,9 @@ export class RealtimeSession {
     const recorder = getRecorder();
 
     recorder.onError(({ message }) => {
+      if (!this.isCurrentConnection(generation)) {
+        return;
+      }
       // A mic fault no longer kills the session: text mode still works.
       void this.stopMic();
       this.handlers.onWarning(`Recorder error: ${message}`);
@@ -449,7 +477,7 @@ export class RealtimeSession {
       },
       ({ buffer, numFrames }) => {
         // A callback can still land after the mic is switched off.
-        if (!this.capturing || this.audioFocusPaused) {
+        if (!this.isCurrentConnection(generation) || !this.capturing || this.audioFocusPaused) {
           return;
         }
 
@@ -500,15 +528,19 @@ export class RealtimeSession {
     );
 
     if (registration.status === "error") {
-      await this.stopMic();
+      await this.stopMicOwned();
       this.handlers.onWarning(`Could not attach mic callback: ${registration.message}`);
       return;
     }
 
     log("starting recorder");
     const started = await recorder.start();
+    if (!this.isCurrentConnection(generation) || micGeneration !== this.micGeneration) {
+      await this.stopMicOwned();
+      return;
+    }
     if (started.status === "error") {
-      await this.stopMic();
+      await this.stopMicOwned();
       this.handlers.onWarning(`Recorder failed to start: ${started.message}`);
       return;
     }
@@ -517,15 +549,27 @@ export class RealtimeSession {
 
   /** Stops streaming the mic without touching the socket or playback. */
   async stopMic(): Promise<void> {
-    if (!this.capturing) {
-      return;
-    }
+    const generation = this.connectionGeneration;
+    this.micGeneration += 1;
+    this.pauseMicDelivery();
+    await serializeAudioLifecycle(async () => {
+      if (generation === this.connectionGeneration && this.ownsAudioSession) {
+        await this.stopRecorder();
+        this.send({ type: "input_audio_buffer.clear" });
+      }
+    });
+  }
+
+  private pauseMicDelivery(): void {
     log("mic off");
     this.capturing = false;
     this.userSpeechActive = false;
     this.handlers.onMicState(false);
     this.handlers.onSpeechActivity(false);
+  }
 
+  private async stopMicOwned(): Promise<void> {
+    this.pauseMicDelivery();
     await this.stopRecorder();
 
     // Drop a half-spoken utterance so VAD cannot commit it later.
@@ -825,7 +869,20 @@ export class RealtimeSession {
         this.diagnostics.playbackState = "decoding";
         const context = getAudioContext();
         if (context.state !== "running") {
-          await context.resume();
+          await serializeAudioLifecycle(async () => {
+            if (
+              this.active && this.ownsAudioSession && !this.audioFocusPaused &&
+              this.queue === queue && playbackGeneration === this.playbackGeneration
+            ) {
+              await context.resume();
+            }
+          });
+        }
+        if (
+          !this.active || this.audioFocusPaused || this.queue !== queue ||
+          playbackGeneration !== this.playbackGeneration
+        ) {
+          return;
         }
         this.diagnostics.contextState = describeContext();
 
@@ -914,10 +971,14 @@ export class RealtimeSession {
     if (this.audioFocusSubscriptions.length > 0) {
       return;
     }
+    const generation = this.connectionGeneration;
 
     const interruption = AudioManager.addSystemEventListener(
       "interruption",
       (event) => {
+        if (!this.isCurrentConnection(generation)) {
+          return;
+        }
         this.queueFocusTransition(() =>
           event.type === "began"
             ? this.handleAudioFocusPause()
@@ -926,6 +987,9 @@ export class RealtimeSession {
       }
     );
     const duck = AudioManager.addSystemEventListener("duck", () => {
+      if (!this.isCurrentConnection(generation)) {
+        return;
+      }
       this.queueFocusTransition(() => this.handleAudioFocusPause());
     });
     this.audioFocusSubscriptions = [];
@@ -938,15 +1002,18 @@ export class RealtimeSession {
   }
 
   private queueFocusTransition(operation: () => Promise<void>): void {
-    this.focusChangeChain = this.focusChangeChain
-      .then(operation)
-      .catch((error: unknown) => {
-        log(
-          `audio focus transition failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      });
+    const generation = this.connectionGeneration;
+    void serializeAudioLifecycle(async () => {
+      if (this.isCurrentConnection(generation) && this.ownsAudioSession) {
+        await operation();
+      }
+    }).catch((error: unknown) => {
+      log(
+        `audio focus transition failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    });
   }
 
   private async handleAudioFocusEnd(shouldResume: boolean): Promise<void> {
@@ -963,11 +1030,27 @@ export class RealtimeSession {
     this.audioFocusPaused = false;
     this.resumeMicAfterFocusGain = false;
 
+    const generation = this.connectionGeneration;
+    if (Platform.OS === "ios") {
+      await AudioManager.setAudioSessionActivity(true);
+      if (!this.isCurrentConnection(generation)) {
+        return;
+      }
+    }
     await getAudioContext().resume();
+    if (!this.isCurrentConnection(generation)) {
+      return;
+    }
+    if (Platform.OS === "ios") {
+      await applyVoiceRoute(getVoiceRoute());
+      if (!this.isCurrentConnection(generation)) {
+        return;
+      }
+    }
     this.diagnostics.contextState = describeContext();
     this.emitDiagnostics(true);
     if (shouldResumeMic) {
-      await this.startMic();
+      await this.startMicOwned(generation, ++this.micGeneration);
     }
     this.handlers.onWarning("Audio focus returned; voice resumed");
   }
@@ -977,14 +1060,22 @@ export class RealtimeSession {
       return;
     }
 
+    const generation = this.connectionGeneration;
     const wasCapturing = this.capturing;
+    this.micGeneration += 1;
     this.audioFocusPaused = true;
     this.resumeMicAfterFocusGain = wasCapturing;
-    if (wasCapturing) {
-      await this.stopMic();
-    }
     this.invalidatePlayback();
+    if (wasCapturing) {
+      await this.stopMicOwned();
+    }
+    if (!this.isCurrentConnection(generation)) {
+      return;
+    }
     await getAudioContext().suspend();
+    if (!this.isCurrentConnection(generation)) {
+      return;
+    }
     this.diagnostics.contextState = describeContext();
     this.emitDiagnostics(true);
     this.handlers.onWarning("Voice paused because audio focus was lost");
@@ -1055,11 +1146,14 @@ export class RealtimeSession {
     }
     this.active = false;
     const teardownGeneration = ++this.connectionGeneration;
+    this.micGeneration += 1;
+    this.capturing = false;
+    this.invalidatePlayback();
     this.emitDiagnostics(true);
     this.handlers.onSpeechActivity(false);
     this.handlers.onMicState(false);
     this.handlers.onStatus("disconnecting");
-    void serializeVoiceLifecycle(() => this.teardown()).then(() => {
+    void serializeAudioLifecycle(() => this.teardown()).then(() => {
       if (this.connectionGeneration === teardownGeneration && !this.active) {
         this.handlers.onStatus("error", message);
       }
