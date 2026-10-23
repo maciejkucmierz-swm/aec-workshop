@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 import {
+  getRecordingPermissionsAsync,
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
   setIsAudioActiveAsync,
@@ -324,7 +325,11 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     setDiagnostics({ ...EMPTY_DIAGNOSTICS });
     firstMicFrameRef.current = true;
     try {
-      const permission = await requestRecordingPermissionsAsync();
+      const currentPermission = await getRecordingPermissionsAsync();
+      if (connectionEpoch !== connectionEpochRef.current) return;
+      const permission = currentPermission.granted
+        ? currentPermission
+        : await requestRecordingPermissionsAsync();
       if (connectionEpoch !== connectionEpochRef.current) return;
       if (!permission.granted) throw new Error("Microphone permission was denied");
       if (IS_PROMO) {

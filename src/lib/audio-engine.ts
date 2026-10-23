@@ -208,7 +208,12 @@ export async function activateVoiceSession(
     }
     configureSystemOptions();
 
-    const permission = await AudioManager.requestRecordingPermissions();
+    // Re-requesting an already granted permission can still open Android's
+    // permission activity, backgrounding promo mode and restarting preparation.
+    const currentPermission = await AudioManager.checkRecordingPermissions();
+    const permission = currentPermission === "Granted"
+      ? currentPermission
+      : await AudioManager.requestRecordingPermissions();
     if (permission !== "Granted") {
       throw new Error("Microphone permission denied");
     }
