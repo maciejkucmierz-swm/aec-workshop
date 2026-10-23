@@ -86,6 +86,8 @@ Metro normally supplies the computer's LAN host. If the relay is unreachable, se
 
 ## Using promo mode
 
+<img src="assets/screenshots/promo-iphone.png" alt="Promo mode on a physical iPhone, showing the voice orb, live captions, and three comparison tabs" width="320" />
+
 Tap the orb to start, tap again to end, or tap while connecting to cancel. Only the visible tab prepares a connection; microphone capture starts after your tap. Changing tabs or backgrounding ends the call. Preparation can affect other apps' audio.
 
 The shared TypeGPU orb follows connection, speech-detection, and playback state; it is decorative, not an audio waveform. Captions reveal at an approximate speech pace, not word-level alignment. Light/dark appearance and Reduce Motion are supported. Web has a simple fallback control; physical Android/iPhone are the comparison targets.
