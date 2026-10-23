@@ -1,9 +1,10 @@
 import { Platform, View } from "react-native";
 
 import { ExpoVoiceAgent } from "@/components/expo-audio/voice-agent";
-import { WorkshopHeading, WorkshopSurface, workshopStyles } from "@/lib/workshop-ui";
+import { WorkshopHeading, WorkshopSurface, useWorkshopStyles } from "@/lib/workshop-ui";
 
 export default function ExpoDuplexScreen() {
+  const workshopStyles = useWorkshopStyles();
   return (
     <WorkshopSurface>
       <View style={workshopStyles.content}>

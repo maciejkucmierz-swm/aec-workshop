@@ -175,6 +175,7 @@ export class RealtimeSession {
   /** Prevents callbacks from an older socket changing a newer session. */
   private connectionGeneration = 0;
   private active = false;
+  private waitingForSessionUpdate = false;
   /** This session is responsible for releasing the shared native audio session. */
   private ownsAudioSession = false;
   /** No voice media may run while another app owns Android audio focus. */
@@ -205,14 +206,15 @@ export class RealtimeSession {
 
   constructor(private readonly handlers: SessionHandlers) {}
 
-  /** Opens the socket and readies playback. The mic stays off until asked. */
-  async connect(): Promise<void> {
+  /** Prepares native audio and the socket without starting microphone capture. */
+  async connect({ waitForSessionReady = false }: { waitForSessionReady?: boolean } = {}): Promise<void> {
     if (this.active) {
       return;
     }
 
     const connectionGeneration = ++this.connectionGeneration;
     this.active = true;
+    this.waitingForSessionUpdate = waitForSessionReady;
     this.handlers.onStatus("connecting");
 
     let ephemeralKey: string;
@@ -250,35 +252,10 @@ export class RealtimeSession {
       this.emitDiagnostics(true);
 
       try {
-        // From this point the session owns the shared hardware until teardown.
-        this.ownsAudioSession = true;
-        // Subscribe before the native session requests focus so a loss during
-        // setup cannot race the first capture or playback buffer.
-        this.subscribeAudioFocus();
-        if (Platform.OS === "ios") {
-          AudioManager.observeAudioInterruptions(true);
-        }
-        log("key received, activating audio session");
-        await activateVoiceSession(this.handlers.audioStreamProfile);
+        await this.prepareAudioOwned(connectionGeneration);
         if (!this.isCurrentConnection(connectionGeneration)) {
           return;
         }
-        log("audio session active (communication mode)");
-        this.diagnostics.contextState = describeContext();
-
-        const queue = createPlaybackQueue();
-        this.queue = queue;
-        queue.onBufferEnded = (event) => {
-          if (this.queue !== queue || !this.isCurrentConnection(connectionGeneration)) {
-            return;
-          }
-          this.diagnostics.buffersEnded += 1;
-          this.pendingBuffers = Math.max(0, this.pendingBuffers - 1);
-          if (event.isLastBufferInQueue && this.pendingBuffers === 0) {
-            this.diagnostics.playbackState = "drained";
-          }
-          this.emitDiagnostics(true);
-        };
         // React Native cannot set headers on a WebSocket handshake, so the
         // ephemeral key travels as a subprotocol like it does in browsers.
         const socket = new WebSocket(REALTIME_URL, [
@@ -292,7 +269,7 @@ export class RealtimeSession {
             return;
           }
           log("websocket open");
-          this.handlers.onStatus("connected");
+          if (!waitForSessionReady) this.handlers.onStatus("connected");
           // Assert the config here too, rather than trusting the minted session.
           this.send(SESSION_UPDATE);
 
@@ -330,6 +307,29 @@ export class RealtimeSession {
         this.fail(error instanceof Error ? error.message : String(error), connectionGeneration);
       }
     });
+  }
+
+  /** Called inside the lifecycle queue before the connection becomes ready. */
+  private async prepareAudioOwned(generation: number): Promise<void> {
+    if (this.ownsAudioSession || !this.isCurrentConnection(generation)) return;
+    this.ownsAudioSession = true;
+    this.subscribeAudioFocus();
+    if (Platform.OS === "ios") AudioManager.observeAudioInterruptions(true);
+    await activateVoiceSession(this.handlers.audioStreamProfile);
+    if (!this.isCurrentConnection(generation)) return;
+    getRecorder();
+    this.diagnostics.contextState = describeContext();
+    const queue = createPlaybackQueue();
+    this.queue = queue;
+    queue.onbufferended = (event) => {
+      if (this.queue !== queue || !this.isCurrentConnection(generation)) return;
+      this.diagnostics.buffersEnded += 1;
+      this.pendingBuffers = Math.max(0, this.pendingBuffers - 1);
+      if (event.isLastBufferInQueue && this.pendingBuffers === 0) {
+        this.diagnostics.playbackState = "drained";
+      }
+      this.emitDiagnostics(true);
+    };
   }
 
   async disconnect(): Promise<void> {
@@ -428,12 +428,20 @@ export class RealtimeSession {
 
   /** Starts streaming the mic. Requires an open socket; leaves it alone on failure. */
   async startMic(): Promise<void> {
-    if (this.capturing || !this.active || !this.ownsAudioSession) {
+    if (this.capturing || !this.active) {
       return;
     }
     const generation = this.connectionGeneration;
     const micGeneration = ++this.micGeneration;
-    await serializeAudioLifecycle(() => this.startMicOwned(generation, micGeneration));
+    try {
+      await serializeAudioLifecycle(async () => {
+        if (!this.isCurrentConnection(generation) || micGeneration !== this.micGeneration) return;
+        await this.prepareAudioOwned(generation);
+        await this.startMicOwned(generation, micGeneration);
+      });
+    } catch (error) {
+      this.fail(error instanceof Error ? error.message : String(error), generation);
+    }
   }
 
   /** Called only while holding the shared native lifecycle queue. */
@@ -456,7 +464,7 @@ export class RealtimeSession {
     }
 
     this.capturing = true;
-    this.handlers.onMicState(true);
+    let firstBuffer = true;
 
     const recorder = getRecorder();
 
@@ -477,8 +485,13 @@ export class RealtimeSession {
       },
       ({ buffer, numFrames }) => {
         // A callback can still land after the mic is switched off.
-        if (!this.isCurrentConnection(generation) || !this.capturing || this.audioFocusPaused) {
+        if (!this.isCurrentConnection(generation) || micGeneration !== this.micGeneration ||
+          !this.capturing || this.audioFocusPaused || numFrames <= 0) {
           return;
+        }
+        if (firstBuffer) {
+          firstBuffer = false;
+          this.handlers.onMicState(true);
         }
 
         if (this.diagnostics.micChunks === 0) {
@@ -607,6 +620,10 @@ export class RealtimeSession {
       case "session.created":
       case "session.updated":
         this.recordEvent(event.type);
+        if (event.type === "session.updated" && this.waitingForSessionUpdate) {
+          this.waitingForSessionUpdate = false;
+          this.handlers.onStatus("connected");
+        }
         break;
 
       // Claims a conversation slot before any transcript text exists, which is
@@ -950,8 +967,7 @@ export class RealtimeSession {
 
   private startQueue(queue: AudioBufferQueueSourceNode): void {
     try {
-      // The offset must be passed explicitly: its default of -1 fails the
-      // node's own non-negative check.
+      // Start at the context's current time with no offset into the queued audio.
       queue.start(getAudioContext().currentTime, 0);
       this.queueStarted = true;
     } catch (error) {
@@ -963,7 +979,7 @@ export class RealtimeSession {
   }
 
   /**
-   * The patched AudioManager owns the VOICE_COMMUNICATION/SPEECH focus request.
+   * The upstream communication session owns the voice-communication focus request.
    * The app owns media behavior, so focus loss must suspend both the context
    * and microphone instead of letting speech duck or leak.
    */
@@ -1084,7 +1100,7 @@ export class RealtimeSession {
   private invalidatePlayback(): void {
     try {
       this.playbackGeneration += 1;
-      // clearBuffers drops the queue without firing onBufferEnded, and rewinds
+      // clearBuffers drops the queue without firing onbufferended, and rewinds
       // the read index natively, so the pending count resets with it.
       this.pendingBuffers = 0;
       // Dropped audio never reaches the speaker, so the window ends now.
@@ -1099,6 +1115,7 @@ export class RealtimeSession {
 
   private stopPlayback(): void {
     this.invalidatePlayback();
+    if (this.queue) this.queue.onbufferended = null;
     try {
       this.queue?.stop();
       this.queue?.disconnect();

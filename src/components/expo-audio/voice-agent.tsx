@@ -20,15 +20,17 @@ import {
 
 import { encodeBase64, REALTIME_SAMPLE_RATE } from "@/lib/pcm";
 import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
+import { IS_PROMO } from "@/lib/app-mode";
+import { usePromoConnection } from "@/lib/use-promo-connection";
+import { PromoVoiceScreen } from "@/components/promo-voice-screen";
 import { resolveVoiceSocketUrl } from "@/lib/token-url";
 import {
-  WORKSHOP_STATUS_COLOR,
   WorkshopHeading,
   useWorkshopColors,
-  workshopStyles,
+  useWorkshopStyles,
 } from "@/lib/workshop-ui";
 
-type RelayPhase = "idle" | "connecting" | "listening" | "assistant" | "error";
+type RelayPhase = "idle" | "connecting" | "ready" | "listening" | "assistant" | "error";
 type TranscriptEntry = { id: string; role: "user" | "assistant"; text: string };
 type DuplexMode = "half-duplex" | "full-duplex";
 type Diagnostics = {
@@ -48,14 +50,6 @@ const SPEAKER_MODE = {
   interruptionMode: "doNotMix",
   shouldRouteThroughEarpiece: false,
 } as const;
-
-const PHASE_COLOR: Record<RelayPhase, string> = {
-  idle: WORKSHOP_STATUS_COLOR.idle,
-  connecting: WORKSHOP_STATUS_COLOR.connecting,
-  listening: WORKSHOP_STATUS_COLOR.connected,
-  assistant: WORKSHOP_STATUS_COLOR.connected,
-  error: WORKSHOP_STATUS_COLOR.error,
-};
 
 function resampleToRealtime(data: ArrayBuffer, inputRate: number): Uint8Array {
   const input = new Int16Array(data);
@@ -83,7 +77,9 @@ function resampleToRealtime(data: ArrayBuffer, inputRate: number): Uint8Array {
 
 export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   const colors = useWorkshopColors();
+  const workshopStyles = useWorkshopStyles();
   const socketRef = useRef<WebSocket | null>(null);
+  const connectingRef = useRef(false);
   const connectionEpochRef = useRef(0);
   const relayReadyRef = useRef(false);
   const micEnabledRef = useRef(false);
@@ -102,6 +98,8 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   } | null>(null);
   const playingRef = useRef(false);
   const [phase, setPhase] = useState<RelayPhase>("idle");
+  const [captureReady, setCaptureReady] = useState(false);
+  const [userSpeaking, setUserSpeaking] = useState(false);
   const [detail, setDetail] = useState<string | null>(null);
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
   const [draft, setDraft] = useState("");
@@ -139,13 +137,14 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     channels: 1,
     encoding: "int16",
     onBuffer: ({ data, sampleRate, channels }) => {
-      if (!relayReadyRef.current || !micEnabledRef.current || channels !== 1) {
+      if (!relayReadyRef.current || !micEnabledRef.current || channels !== 1 || data.byteLength === 0) {
         return;
       }
       lastMicBufferAtRef.current = Date.now();
       const pcm = resampleToRealtime(data, sampleRate);
       if (firstMicFrameRef.current) {
         firstMicFrameRef.current = false;
+        setCaptureReady(true);
         setCaptureInfo(
           `mono Int16 · ${sampleRate} Hz → ${REALTIME_SAMPLE_RATE} Hz`,
         );
@@ -183,6 +182,8 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
 
   const stopMic = useCallback(() => {
     micEnabledRef.current = false;
+    setCaptureReady(false);
+    setUserSpeaking(false);
     lastMicBufferAtRef.current = null;
     return serializeAudioLifecycle(() => {
       if (!micStartedRef.current) {
@@ -212,6 +213,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
   const endConnection = useCallback(
     (nextPhase?: RelayPhase, nextDetail?: string) => {
       connectionEpochRef.current += 1;
+      connectingRef.current = false;
       relayReadyRef.current = false;
       const socket = socketRef.current;
       socketRef.current = null;
@@ -255,8 +257,10 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       if (!isCurrentCapture()) {
         return;
       }
-      audioSessionOwnedRef.current = true;
-      await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: true });
+      if (!IS_PROMO || !audioSessionOwnedRef.current) {
+        audioSessionOwnedRef.current = true;
+        await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: true });
+      }
       if (!isCurrentCapture()) {
         return;
       }
@@ -307,28 +311,31 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     [metric, mode, startMic, stopPlayback],
   );
 
-  const connect = useCallback(async () => {
-    if (phase === "connecting" || phase === "listening" || phase === "assistant") {
-      endConnection("idle");
-      return;
-    }
-
+  const openConnection = useCallback(async () => {
+    if (connectingRef.current || socketRef.current) return;
     endConnection();
+    connectingRef.current = true;
     const connectionEpoch = ++connectionEpochRef.current;
     setPhase("connecting");
     setDetail(null);
-    setEntries([]);
+    if (!IS_PROMO) setEntries([]);
     setCaptureInfo("--");
     diagnosticsRef.current = { ...EMPTY_DIAGNOSTICS };
     setDiagnostics({ ...EMPTY_DIAGNOSTICS });
     firstMicFrameRef.current = true;
     try {
       const permission = await requestRecordingPermissionsAsync();
-      if (connectionEpoch !== connectionEpochRef.current) {
-        return;
-      }
-      if (!permission.granted) {
-        throw new Error("Microphone permission was denied");
+      if (connectionEpoch !== connectionEpochRef.current) return;
+      if (!permission.granted) throw new Error("Microphone permission was denied");
+      if (IS_PROMO) {
+        await serializeAudioLifecycle(async () => {
+          if (connectionEpoch !== connectionEpochRef.current) return;
+          audioSessionOwnedRef.current = true;
+          await setAudioModeAsync({ ...SPEAKER_MODE, allowsRecording: true });
+          if (connectionEpoch !== connectionEpochRef.current) return;
+          if (Platform.OS === "ios") await setIsAudioActiveAsync(true);
+        });
+        if (connectionEpoch !== connectionEpochRef.current) return;
       }
       const socket = new WebSocket(resolveVoiceSocketUrl());
       if (connectionEpoch !== connectionEpochRef.current) {
@@ -351,7 +358,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
         if (!isCurrentSocket()) {
           return;
         }
-        endConnection("idle");
+        endConnection(IS_PROMO ? "error" : "idle", IS_PROMO ? "Relay disconnected" : undefined);
       };
       socket.onmessage = (message) => {
         if (!isCurrentSocket()) {
@@ -364,8 +371,10 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
           return;
         }
         if (event.type === "relay.ready") {
+          connectingRef.current = false;
           relayReadyRef.current = true;
-          void startMic();
+          if (IS_PROMO) setPhase("ready");
+          else void startMic();
           return;
         }
         if (event.type === "relay.stats" && typeof event.receivedMicBuffers === "number") {
@@ -444,14 +453,13 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
           stopTurn(event.reason);
           return;
         }
-        if (
-          event.type === "speech" &&
-          event.active === true &&
-          playbackRef.current?.legacy
-        ) {
-          // Older relays stop tracking playback when encoding ends. Their VAD
-          // event still lets us interrupt audio buffered on the phone.
-          stopTurn("barge-in");
+        if (event.type === "speech") {
+          setUserSpeaking(event.active === true && micEnabledRef.current);
+          if (event.active === true && playbackRef.current?.legacy) {
+            // Older relays stop tracking playback when encoding ends. Their VAD
+            // event still lets us interrupt audio buffered on the phone.
+            stopTurn("barge-in");
+          }
           return;
         }
         if (event.type === "error" || event.type === "relay.closed") {
@@ -473,7 +481,6 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     endConnection,
     metric,
     mode,
-    phase,
     player,
     startMic,
     stopMic,
@@ -481,6 +488,26 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
     stopTurn,
     upsertTranscript,
   ]);
+
+  const connectionStatus = phase === "ready" || phase === "listening" || phase === "assistant"
+    ? "connected" : phase;
+  const { connection: promoConnection, requested: promoRequested, toggle: togglePromo } = usePromoConnection({
+    status: connectionStatus,
+    microphoneActive: captureReady && isStreaming,
+    connect: openConnection,
+    disconnect: () => endConnection("idle"),
+    startMic,
+  });
+  const connect = useCallback(() => {
+    if (IS_PROMO) {
+      if (!promoRequested || phase === "error") setEntries([]);
+      togglePromo();
+    } else if (phase === "connecting" || phase === "listening" || phase === "assistant") {
+      endConnection("idle");
+    } else {
+      void openConnection();
+    }
+  }, [endConnection, openConnection, phase, promoRequested, togglePromo]);
 
   useEffect(() => {
     const subscription = player.addListener("playbackStatusUpdate", (status) => {
@@ -541,7 +568,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       }, 1_000);
       return () => {
         clearInterval(timer);
-        endConnection("idle");
+        if (!IS_PROMO) endConnection("idle");
       };
     }, [endConnection]),
   );
@@ -575,6 +602,22 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
 
   const canSend = phase === "listening" && Boolean(draft.trim());
   const canDisconnect = phase !== "idle" && phase !== "error";
+  const assistantPlaying = phase === "assistant" &&
+    playerStatus.playing && !playerStatus.isBuffering;
+
+  if (IS_PROMO) {
+    return (
+      <PromoVoiceScreen
+        connection={promoConnection}
+        microphoneActive={promoRequested && captureReady && isStreaming}
+        userSpeaking={userSpeaking}
+        assistantPlaying={assistantPlaying}
+        entries={entries}
+        error={detail}
+        onToggleConnection={() => void connect()}
+      />
+    );
+  }
 
   return (
     <>
@@ -590,28 +633,30 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
       />
       <View style={workshopStyles.statusRow}>
         <View
-          style={[workshopStyles.statusDot, { backgroundColor: PHASE_COLOR[phase] }]}
+          style={[workshopStyles.statusDot, {
+            backgroundColor: colors.status[phase === "ready" || phase === "listening" ? "connected" : phase],
+          }]}
         />
         <Text style={[workshopStyles.statusText, { color: colors.text }]}>
           {statusLabel}
         </Text>
       </View>
-      {detail ? <Text style={styles.warning}>{detail}</Text> : null}
+      {detail ? <Text style={workshopStyles.warningText}>{detail}</Text> : null}
       <ScrollView
         style={styles.transcript}
         contentContainerStyle={styles.transcriptContent}
       >
         {entries.length === 0 ? (
-          <Text style={[styles.muted, { color: colors.muted }]}>
+          <Text style={[workshopStyles.placeholder, { color: colors.muted }]}>
             Connect, then speak a turn.
           </Text>
         ) : (
           entries.map((entry) => (
             <View key={entry.id} style={styles.entry}>
-              <Text style={[styles.role, { color: colors.muted }]}>
+              <Text style={[workshopStyles.entryRole, { color: colors.muted }]}>
                 {entry.role === "user" ? "You" : "Assistant"}
               </Text>
-              <Text style={[styles.entryText, { color: colors.text }]}>
+              <Text style={[workshopStyles.entryText, { color: colors.text }]}>
                 {entry.text}
               </Text>
             </View>
@@ -643,20 +688,20 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
         </Pressable>
       </View>
       <View style={[styles.diagnostics, { backgroundColor: colors.panel }]}>
-        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.diagnosticText, { color: colors.muted }]}>
           Relay: {resolveVoiceSocketUrl()}
         </Text>
-        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.diagnosticText, { color: colors.muted }]}>
           speaker route · capture: {captureInfo}
         </Text>
-        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.diagnosticText, { color: colors.muted }]}>
           Mic: {isStreaming ? "streaming" : "stopped"} · Assistant: {assistantStatus}
         </Text>
-        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.diagnosticText, { color: colors.muted }]}>
           Buffers sent during playback: {diagnostics.sentDuringPlayback}
           {" · Relay received: "}{diagnostics.receivedMicBuffers ?? "--"}
         </Text>
-        <Text style={[styles.diagnosticText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.diagnosticText, { color: colors.muted }]}>
           Interruptions: {diagnostics.interruptions} · Player timing is approximate, not acoustic output.
         </Text>
       </View>
@@ -667,7 +712,7 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
         ]}
         onPress={() => void connect()}
       >
-        <Text style={workshopStyles.callLabel}>
+        <Text style={[workshopStyles.callLabel, canDisconnect && workshopStyles.callLabelStop]}>
           {canDisconnect ? "Disconnect" : "Connect"}
         </Text>
       </Pressable>
@@ -676,13 +721,8 @@ export function ExpoVoiceAgent({ mode }: { mode: DuplexMode }) {
 }
 
 const styles = StyleSheet.create({
-  warning: { color: "#FF9F0A", fontSize: 13 },
-  muted: { fontSize: 12, lineHeight: 17 },
   transcript: { flex: 1 },
   transcriptContent: { gap: 12, paddingVertical: 8 },
   entry: { gap: 2 },
-  role: { fontSize: 12, fontWeight: "600" },
-  entryText: { fontSize: 16 },
   diagnostics: { borderRadius: 8, gap: 2, padding: 8 },
-  diagnosticText: { fontSize: 11, lineHeight: 16 },
 });

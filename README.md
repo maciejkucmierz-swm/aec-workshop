@@ -1,91 +1,123 @@
-# Full-duplex voice agent audio workshop
+# AEC Workshop
 
-An Expo SDK 57 / React Native 0.86 workshop for comparing voice-agent audio paths on physical devices. It streams 24 kHz PCM16 microphone audio to a local relay and plays streamed assistant audio.
+A React Native / Expo voice-agent comparison with two presentations: a developer workshop and a minimal, three-tab promo app. Both use real microphone input, assistant audio, and transcripts—not prerecorded conversations.
 
-## What it compares
+Built with Expo SDK 57, React Native 0.86, stock Expo Audio, and an official React Native Audio API (RNAA) nightly. No custom native patches or local library checkout is required. **Expo Go is not supported.**
 
-- **Patched** — RNAA communication capture and voice output, including the platform voice-processing path where available.
-- **Upstream** — the same RNAA app flow with upstream stream defaults.
-- **Media** (Android only) — communication capture with media-style assistant output.
-- **Expo** — stock Expo Audio half duplex. Android also offers a `mic` versus `voice_communication` recorder diagnostic.
-- **Duplex** — stock Expo Audio microphone streaming throughout progressive AAC assistant playback, with spoken interruption and live diagnostics. Implemented on Android and iPhone; iPhone simultaneous capture/playback remains a device-unverified experiment.
+## Comparisons
 
-Android shows all five tabs; iOS shows Patched, Upstream, Expo, and Duplex. The two RNAA voice tabs retain their processing distinction on iOS. Phone/Speaker selection uses the actual built-in receiver/loudspeaker route, restored after a resumable interruption. The Media profile and recorder-source diagnostic are Android-specific and hidden on iOS.
+| Workshop tab | Audio path |
+| --- | --- |
+| Voice | RNAA communication capture and voice output; platform voice processing where available |
+| Defaults | RNAA without voice processing, with media output |
+| Media | RNAA communication capture with media output; Android only |
+| Expo | Stock Expo Audio half duplex; pauses the microphone during replies |
+| Duplex | Stock Expo Audio simultaneous capture and progressive AAC playback |
 
-Results are device-specific evidence, not a guarantee of AEC performance across routes, volumes, rooms, or devices.
+Android's Expo tab also includes a six-capture `mic` versus `voice_communication` recorder diagnostic. iOS hides Media and this Android-only diagnostic.
 
-### Full-duplex comparison on Android
+Promo mode shows **RNAA 0.X → Expo → RNAA 1.X**, with a tappable animated orb and live captions. These are comparison labels: both RNAA tabs use the **same installed package**, with different processing options. Expo uses full duplex, not half duplex. Voice / RNAA 1.X remains the home screen.
 
-Keep loudspeaker volume, phone position, network, and prompt fixed. Run three trials each in Patched, Expo (half duplex), and Duplex:
+AEC means acoustic echo cancellation. Results depend on the device, route, volume, and room; this showcase does not establish production readiness or universal Expo limitations. iPhone Expo full duplex remains an acoustic experiment, not a device-verified guarantee.
 
-1. Ask the assistant to count slowly to twenty, then stay silent. Note whether its speech appears as a **You** transcript or causes an interruption.
-2. Interrupt with a different question while it speaks. Repeat late in the reply, when generation may have finished but playback is still buffered. Listen for a prompt stop and any stale replay.
-3. In Duplex, check that **Buffers sent during playback** and **Relay received** increase together while the assistant is audible. The former counts buffers sent during observed playback; the latter counts all microphone buffers accepted by the relay for this connection.
-4. Disconnect/reconnect and change tabs during a reply. Capture and playback should stop when leaving. Half duplex should pause capture for every reply; its playback buffer count should remain zero.
+## Requirements
 
-Playback replacement, observed start, completion, and interruption timestamps appear in Metro and relay logs. Player timing is approximate and does not measure acoustic output. Record actual observations; a VAD interruption alone does not prove echo, and this experiment does not establish universal Expo AEC support or failure. Web execution of Duplex is deferred.
+- macOS or Linux, Git, [Bun](https://bun.sh/), and Node.js 24.3+.
+- [ffmpeg](https://ffmpeg.org/) available on `PATH` for Expo playback and diagnostics.
+- Android Studio / Android SDK for Android; macOS, Xcode, and a development signing team for iOS.
+- A physical phone on the same LAN as the development computer. RNAA's Android communication comparisons require Android 12 / API 31+; the app minimum is API 26.
 
-### iPhone validation (user-run)
-
-Use a physical iPhone in the foreground with its built-in microphone/receiver/loudspeaker. Headsets, Bluetooth, iPad routing, and background operation are not acceptance targets. Build success is not acoustic validation.
-
-1. Grant microphone and local-network access. Start the local relay, confirm the LAN address, and connect in each of the four tabs. If permission was denied, enable it in iOS Settings before retrying.
-2. With fixed phone position, network, prompt, and loudspeaker volume, run three trials each in Patched, Upstream, Expo half duplex, and Duplex. Record audible output, transcripts, echo/self-transcription, false interruptions, and response delay.
-3. In both RNAA tabs, switch Phone/Speaker during a call and verify the **actual audible** receiver/loudspeaker output. Try a system interruption, then return and confirm the selected route/capture recover when iOS permits resumption.
-4. In Expo half duplex, verify the mic pauses before every reply and resumes only after playback finishes. No barge-in is supported.
-5. In Duplex, confirm audible assistant playback **and** increasing sent-during-playback/relay-received counts. Test spoken interruption during generation and late buffered playback; there must be no stale replay. Silence during assistant-only speech and note any self-transcription or false interruptions.
-6. Disconnect during setup, reconnect immediately, and switch tabs during playback. The old mic/playback must stop before the next tab activates.
-
-Expo remains entirely stock: half duplex switches to playback-only after mic cleanup, then back to recording when listening. Duplex reapplies recording-enabled speaker mode after microphone startup because SDK 57's iOS stream selects recording-only mode. The documented [`keepAudioSessionActive` player option](https://docs.expo.dev/versions/v57.0.0/sdk/audio/#audioplayeroptions) prevents pause/completion from deactivating the microphone's session; disconnect explicitly releases it through the shared lifecycle queue. This public-API sequence may itself interrupt capture; three seconds without microphone buffers ends the session with an explicit capture error, not a silent half-duplex/native-AEC fallback. Report that limitation if encountered.
-
-## Prerequisites
-
-- macOS or Linux with [Bun](https://bun.sh/), Git, and the system `patch` command.
-- [ffmpeg](https://ffmpeg.org/) on your `PATH` for the local relay and Expo Audio diagnostic.
-- Android Studio and an Android SDK for Android builds. Xcode is additionally required for iOS builds.
-- A physical device on the same LAN as this computer for voice testing.
-
-Expo Go is not supported. This workshop uses native RNAA code and requires a development or release build.
-
-## Setup
+## Install and configure
 
 ```bash
-bun install
+git clone https://github.com/maciejkucmierz-swm/aec-workshop.git
+cd aec-workshop
+bun install --frozen-lockfile
 cp .env.example .env.local
 ```
 
-Set `OPENAI_API_KEY` in `.env.local`. The key is used only by `server/index.mjs`; do not commit it or expose it through an `EXPO_PUBLIC_` variable.
+Set `OPENAI_API_KEY` in `.env.local` to your OpenAI API key. It is read only by the local server. **Never name it `EXPO_PUBLIC_OPENAI_API_KEY`, commit it, or include local environment files or development logs in shared artifacts.** An existing shell `OPENAI_API_KEY` takes precedence over `.env.local`; unset it if the server uses an old key.
 
-Run the local relay and Metro in separate terminals:
+The model, voice, and VAD (voice activity detection) settings live in [shared/realtime-config.json](shared/realtime-config.json). Your API account must have access to the configured models. The relay is a trusted-LAN demo server, not an authenticated public service.
+
+## Run in three terminals
+
+Run each command from the repository root.
+
+**1. Local voice relay**
 
 ```bash
 bun run token-server
 ```
 
-Restart this process after relay code changes. Metro refreshes the app, not the relay. The Expo agent accepts older audio messages too, but relay buffer counts require the updated relay; `--` means no count has been received.
+It listens on port 8787. Check `http://localhost:8787/health`; `ffmpegAvailable` should be `true`. Restart this process after server changes.
+
+**2. Metro — choose a presentation**
 
 ```bash
-bun run start
+# Minimal promo app:
+EXPO_PUBLIC_APP_MODE=promo bun run start -- --dev-client --lan --port 8081
+
+# Or the full workshop, instead of the command above:
+EXPO_PUBLIC_APP_MODE=workshop bun run start -- --dev-client --lan --port 8081
 ```
 
-Build and install a native development client when first setting up, or after native dependency/config changes:
+You can also set `EXPO_PUBLIC_APP_MODE=promo` in `.env.local`. Unset it for the workshop; any value other than `promo` selects the workshop. Changing modes requires a Metro restart, **not** a native rebuild.
+
+**3. Build, install, and open on a phone**
 
 ```bash
-bun run android
-# or, on macOS with Xcode:
-bun run ios
+# iPhone (macOS only):
+bun run ios -- --device --port 8081
+
+# Or Android:
+bun run android -- --device --port 8081
 ```
 
-For a physical device, Metro normally supplies the computer's LAN host automatically. If it does not, set `EXPO_PUBLIC_TOKEN_URL=http://YOUR_LAN_IP:8787` in `.env.local` and restart Metro. iOS requests local-network access; its configuration permits local networking without a global arbitrary-network exception.
+Select your connected device when prompted. On iPhone, keep it unlocked, enable Developer Mode, choose your own signing team if requested, and trust the developer profile in Settings when required. Allow microphone and local-network access. If signing fails, open `ios/aecworkshop.xcworkspace` in Xcode and configure Signing & Capabilities for your team.
 
-## Native patches
+After the first build, open the installed development client and select Metro / scan its QR code. JavaScript-only changes do not need another native build. Dependency or native configuration changes do: run `bun install --frozen-lockfile`, `bunx expo prebuild --platform ios` (or `android`), then the build command above.
 
-The RNAA comparison tabs rely on the version-pinned patches in `patches/`. `bun install` applies them automatically to `react-native-audio-api@0.13.3`. No patched `node_modules` files or generated `android`/`ios` directories are committed; a clean install reproduces the native setup.
+If 8081 is occupied, replace it in **both** Metro and build commands with a free port, such as 8084. Do not combine Expo's `--port` and `--no-bundler` options. Stop relay and Metro with Ctrl+C.
 
-After pulling patch or native configuration changes, run `bun install` and rebuild the development client (including regenerating an existing native project with `bunx expo prebuild --platform ios` on macOS). The incremental iOS routing patch has its own installer marker, so previously patched dependencies receive it too. Metro refresh alone cannot load native changes.
+### LAN troubleshooting
 
-## Checks
+Metro normally supplies the computer's LAN host. If the relay is unreachable, set `EXPO_PUBLIC_TOKEN_URL=http://YOUR_COMPUTER_LAN_IP:8787` in `.env.local` and restart Metro. Do not use `localhost` for a physical phone. If changing `TOKEN_SERVER_PORT`, update this URL too. Allow the ports through your firewall and avoid guest Wi-Fi client isolation.
+
+## Using promo mode
+
+Tap the orb to start, tap again to end, or tap while connecting to cancel. Only the visible tab prepares a connection; microphone capture starts after your tap. Changing tabs or backgrounding ends the call. Preparation can affect other apps' audio.
+
+The shared TypeGPU orb follows connection, speech-detection, and playback state; it is decorative, not an audio waveform. Captions reveal at an approximate speech pace, not word-level alignment. Light/dark appearance and Reduce Motion are supported. Web has a simple fallback control; physical Android/iPhone are the comparison targets.
+
+## Upstream RNAA, without patches
+
+The lockfile pins `react-native-audio-api@1.0.0-nightly-331cd7c-20261023`, containing [#1323](https://github.com/software-mansion/react-native-audio-api/pull/1323), [#1324](https://github.com/software-mansion/react-native-audio-api/pull/1324), and [#1317](https://github.com/software-mansion/react-native-audio-api/pull/1317). This is an official **nightly**, not a stable 1.0 release.
+
+- Voice / RNAA 1.X: `androidInputPreset: "voiceCommunication"`, `iosVoiceProcessing: true`, Android output `voiceCommunication`.
+- Defaults / RNAA 0.X: `androidInputPreset: "voiceRecognition"`, `iosVoiceProcessing: false`, Android output `media`.
+- Media: Voice capture options with Android output `media`.
+
+All RNAA profiles use public session APIs. Android uses `inCommunication`; iOS uses `playAndRecord` / `voiceChat`, with `defaultToSpeaker` selected for the speaker preference. iOS routing is a preference, not a forced override. Context/recorder ownership and teardown are shared and serialized. Expo remains stock. Upstream documents an iOS Siri / Bluetooth-HFP interruption-recovery limitation; background and headset behavior are not acceptance targets.
+
+## Checks and manual comparison
 
 ```bash
 bun run check
+bunx expo config --type public
+git diff --check
 ```
+
+`check` runs TypeScript, Expo lint, and server syntax validation. Build success does not establish acoustic quality. On each physical device, keep position, loudspeaker volume, network, and prompt fixed:
+
+1. Ask for a long reply and stay silent; note self-transcription or false interruptions.
+2. Interrupt during speech and late buffered playback; check for prompt cancellation and stale replay.
+3. Confirm Duplex's microphone/relay buffer counts increase during audible assistant playback. Half duplex should pause capture for every reply and resume afterward.
+4. Disconnect/reconnect and change tabs during playback; check that the old call stops. Verify RNAA Phone/Speaker routes by listening.
+5. On Android, run the recorder diagnostic in a quiet room. Treat its results as device-specific evidence, not proof that AEC is enabled.
+
+## Project layout and credits
+
+`src/app` contains routes, `src/components` shared presentation and Expo experiments, `src/lib` RNAA sessions and shared utilities, and `server` the token/voice relay. Generated `ios/`, `android/`, `node_modules/`, and `.expo/` are ignored.
+
+The project retains the [MIT license](LICENSE). Manrope is supplied by `@expo-google-fonts/manrope` under the bundled SIL Open Font License. The orb flow is adapted from `claude-app-clone-main` with permission.

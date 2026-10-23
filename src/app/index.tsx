@@ -1,2 +1,2 @@
-/** The patched implementation is the app's default/home screen. */
+/** The voice-processing comparison is the app's default/home screen. */
 export { default } from "./record";

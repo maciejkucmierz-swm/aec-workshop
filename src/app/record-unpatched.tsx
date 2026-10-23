@@ -1,16 +1,15 @@
 import { VoiceScreen } from "./record";
 
 /**
- * Same React UI, routing, network protocol and session configuration as the
- * patched tab. The only intentional difference is that the native audio API
- * opens streams using react-native-audio-api's upstream defaults.
+ * Same session and UI as the voice-processing tab, but raw/default capture and
+ * media output. Both comparisons use the same unmodified upstream package.
  */
 export default function UpstreamAudioApiVoiceScreen() {
   return (
     <VoiceScreen
       audioStreamProfile="upstream-defaults"
       implementationName="Upstream audio API defaults"
-      implementationDescription="Same call setup, without this app's custom audio-stream patch."
+      implementationDescription="Same call setup, with default capture processing and media output."
     />
   );
 }

@@ -4,6 +4,7 @@ import {
   AudioManager,
   AudioRecorder,
   type AudioBufferQueueSourceNode,
+  type AudioDeviceInfo,
 } from "react-native-audio-api";
 import { encodeBase64, REALTIME_SAMPLE_RATE } from "@/lib/pcm";
 
@@ -13,32 +14,13 @@ export { REALTIME_SAMPLE_RATE } from "@/lib/pcm";
 export const CAPTURE_BUFFER_LENGTH = REALTIME_SAMPLE_RATE / 10;
 
 /**
- * The native module has two stream-construction profiles for the in-app A/B
- * comparison. This must be selected before a context or recorder opens its
- * native stream: Oboe and AVAudioEngine choose their processing path when the
- * stream/graph opens, not while it is already running.
+ * Comparison profiles use only upstream constructor options. They are immutable,
+ * so changing profiles replaces the stopped recorder and suspended context.
  */
 export type AudioStreamProfile =
   | "voice-processing"
   | "upstream-defaults"
   | "media-output";
-
-type AudioApiProfileGlobal = typeof globalThis & {
-  setAudioApiVoiceProcessingProfile?: (profile: number) => void;
-};
-
-function applyAudioStreamProfile(profile: AudioStreamProfile): void {
-  const setter = (globalThis as AudioApiProfileGlobal)
-    .setAudioApiVoiceProcessingProfile;
-  if (!setter) {
-    throw new Error(
-      "The native audio comparison profile is unavailable. Rebuild the development client after applying the native patches."
-    );
-  }
-  setter(
-    profile === "voice-processing" ? 0 : profile === "upstream-defaults" ? 1 : 2,
-  );
-}
 
 let activeStreamProfile: AudioStreamProfile = "voice-processing";
 let audioContext: AudioContext | null = null;
@@ -49,29 +31,41 @@ async function selectAudioStreamProfile(profile: AudioStreamProfile): Promise<vo
     return;
   }
 
+  if (recorder) {
+    recorder.clearOnAudioReady();
+    recorder.clearOnError();
+    if (recorder.isRecording() || recorder.isPaused()) {
+      await recorder.stop();
+    }
+    recorder.disconnect();
+    recorder = null;
+  }
   if (audioContext && audioContext.state !== "closed") {
     await audioContext.close();
   }
   audioContext = null;
-  applyAudioStreamProfile(profile);
   activeStreamProfile = profile;
 }
 
-/**
- * The context runs at the Realtime rate on purpose. Buffer sources read one
- * sample per output frame regardless of the buffer's own rate, so a 24 kHz
- * buffer on a 48 kHz context would play at double speed an octave high.
- */
+/** Keep the playback context and incoming Realtime buffers at the same rate. */
 export function getAudioContext(): AudioContext {
   if (!audioContext || audioContext.state === "closed") {
-    audioContext = new AudioContext({ sampleRate: REALTIME_SAMPLE_RATE });
+    audioContext = new AudioContext({
+      sampleRate: REALTIME_SAMPLE_RATE,
+      androidOutputProfile: activeStreamProfile === "voice-processing"
+        ? "voiceCommunication" : "media",
+    });
   }
   return audioContext;
 }
 
 export function getRecorder(): AudioRecorder {
   if (!recorder) {
-    recorder = new AudioRecorder();
+    const voiceProcessing = activeStreamProfile !== "upstream-defaults";
+    recorder = new AudioRecorder({
+      androidInputPreset: voiceProcessing ? "voiceCommunication" : "voiceRecognition",
+      iosVoiceProcessing: voiceProcessing,
+    });
   }
   return recorder;
 }
@@ -109,6 +103,33 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function configureSystemOptions(): void {
+  AudioManager.setSystemOptions({
+    ios: {
+      category: "playAndRecord",
+      mode: "voiceChat",
+      options: voiceRoute === "speaker"
+        ? ["allowBluetoothHFP", "defaultToSpeaker"]
+        : ["allowBluetoothHFP"],
+    },
+    android: { mode: "inCommunication", communicationDevice: voiceRoute },
+  });
+}
+
+function describeOutput(device: AudioDeviceInfo | undefined | null): string | null {
+  if (!device) return null;
+  switch (device.category) {
+    case "Built-in Speaker":
+    case "Speaker":
+      return "speaker";
+    case "Built-in Earpiece":
+    case "Receiver":
+      return "earpiece";
+    default:
+      return device.name;
+  }
+}
+
 /**
  * Moves communication audio between the earpiece and the loudspeaker.
  *
@@ -130,8 +151,12 @@ export async function applyVoiceRoute(
   }
 
   if (Platform.OS === "ios") {
-    await AudioManager.setCommunicationDevice(route);
-    routedDevice = await AudioManager.getCommunicationDevice();
+    // Upstream communication-device methods are Android-only. iOS routing uses
+    // AVAudioSession options, and the public device list reports the real output.
+    configureSystemOptions();
+    await AudioManager.setAudioSessionActivity(true);
+    const devices = await AudioManager.getDevicesInfo();
+    routedDevice = describeOutput(devices.currentOutputs[0]);
     return routedDevice;
   }
 
@@ -143,8 +168,7 @@ export async function applyVoiceRoute(
 
   while (Date.now() - startedAt < ROUTE_SETTLE_TIMEOUT_MS) {
     const selected = await AudioManager.getCommunicationDevice();
-    routedDevice =
-      typeof selected === "string" && selected.length > 0 ? selected : null;
+    routedDevice = describeOutput(selected);
     if (routedDevice === wanted) {
       return routedDevice;
     }
@@ -165,19 +189,9 @@ export async function applyVoiceRoute(
 }
 
 /**
- * Full duplex needs the platform's voice-processing path on both ends. The
- * upstream package does not expose it through JavaScript, so this app applies
- * the required native patches during installation.
- *
- * On iOS, `playAndRecord` + `voiceChat` only sets the session mode; Apple's AEC
- * additionally requires `setVoiceProcessingEnabled:YES` on the engine's input
- * node, which our native patch applies when rebuilding a voice-chat graph.
- *
- * On Android the library opens capture with Oboe's default input preset on an
- * exclusive low-latency stream. Our native patch instead requests the
- * voice-communication input preset and a shared, normal-performance stream,
- * while the route manager puts the device in communication mode. Hardware AEC
- * remains device-dependent.
+ * Upstream system options configure the communication session; constructor
+ * options configure capture processing and output classification. Android
+ * communication sessions require API 31+. AEC remains device-dependent.
  */
 export async function activateVoiceSession(
   profile: AudioStreamProfile = "voice-processing",
@@ -189,11 +203,10 @@ export async function activateVoiceSession(
   let audioSessionActivated = false;
 
   try {
-    AudioManager.setAudioSessionOptions({
-      iosCategory: "playAndRecord",
-      iosMode: "voiceChat",
-      iosOptions: ["allowBluetoothHFP"],
-    });
+    if (Platform.OS === "android" && Number(Platform.Version) < 31) {
+      throw new Error("RNAA communication comparisons require Android 12 (API 31) or later");
+    }
+    configureSystemOptions();
 
     const permission = await AudioManager.requestRecordingPermissions();
     if (permission !== "Granted") {
@@ -204,8 +217,6 @@ export async function activateVoiceSession(
     audioSessionActivated = true;
     communicationModeActive = Platform.OS === "android" || Platform.OS === "ios";
 
-    // Do not use defaultToSpeaker: clearing a speaker override must restore
-    // the receiver. Apply the user's selection to the active session instead.
     const selected = await applyVoiceRoute(voiceRoute);
     if (communicationModeActive && selected !== voiceRoute) {
       throw new Error(`Could not select ${voiceRoute} for communication audio`);
@@ -217,14 +228,7 @@ export async function activateVoiceSession(
       await applyVoiceRoute(voiceRoute);
     }
 
-    // A focus-loss callback can land while the audio graph is coming up. Check
-    // once more after resume so no capture or playback starts in that window.
-    if (
-      Platform.OS === "android" &&
-      !(await AudioManager.getAudioFocusState())
-    ) {
-      throw new Error("Communication audio focus was lost while starting");
-    }
+    // Focus changes are handled through the session's public interruption events.
   } catch (error) {
     if (audioSessionActivated) {
       await AudioManager.setAudioSessionActivity(false);

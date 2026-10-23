@@ -15,7 +15,7 @@ import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
 import {
   useWorkshopColors,
   WorkshopHeading,
-  workshopStyles,
+  useWorkshopStyles,
 } from "@/lib/workshop-ui";
 
 type RecordingSource = "mic" | "voice_communication";
@@ -52,6 +52,7 @@ export function AecDiagnostic({
   onCancelled,
 }: AecDiagnosticProps) {
   const colors = useWorkshopColors();
+  const workshopStyles = useWorkshopStyles();
   const [running, setRunning] = useState(false);
   const [detail, setDetail] = useState<string | null>(initialDetail);
   const [results, setResults] = useState<DiagnosticResult[]>([]);
@@ -269,11 +270,11 @@ export function AecDiagnostic({
         title="Android recorder AEC diagnostic"
         description="Three mic and three voice_communication captures through the loudspeaker. Temporary M4A files are uploaded once and deleted immediately."
       />
-      <Text style={[styles.instructions, { color: colors.text }]}>
+      <Text style={[workshopStyles.instructions, { color: colors.text }]}>
         Set the same loudspeaker volume, lay the phone still, and do not speak during the 6 captures.
       </Text>
       {detail ? (
-        <Text style={[styles.muted, { color: colors.muted }]}>{detail}</Text>
+        <Text style={[workshopStyles.supportingText, { color: colors.muted }]}>{detail}</Text>
       ) : null}
       <ScrollView
         style={styles.results}
@@ -287,7 +288,7 @@ export function AecDiagnostic({
           return (
             <Text
               key={`${result.source}-${index}`}
-              style={[styles.diagnosticText, { color: colors.text }]}
+              style={[workshopStyles.diagnosticText, { color: colors.text }]}
             >
               {`${result.source.replace("_", " ")} #${runNumber}: `}
               {`correlation ${result.peakCorrelation} · ${result.echoGainDb} dB · ${result.estimatedLagMs} ms`}
@@ -296,7 +297,7 @@ export function AecDiagnostic({
         })}
       </ScrollView>
       {improvement !== null ? (
-        <Text style={[styles.summary, { color: colors.text }]}>
+        <Text style={[workshopStyles.summary, { color: colors.text }]}>
           Median echo gain: mic {micMedian?.toFixed(1)} dB
           {" · voice communication "}{voiceMedian?.toFixed(1)} dB
           {" · reduction "}{improvement.toFixed(1)} dB
@@ -319,10 +320,6 @@ export function AecDiagnostic({
 }
 
 const styles = StyleSheet.create({
-  muted: { fontSize: 12, lineHeight: 17 },
-  instructions: { fontSize: 13, lineHeight: 18 },
   results: { flex: 1 },
   resultsContent: { gap: 12, paddingVertical: 8 },
-  diagnosticText: { fontSize: 11, lineHeight: 16 },
-  summary: { fontSize: 13, fontWeight: "600", lineHeight: 19 },
 });

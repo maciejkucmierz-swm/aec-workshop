@@ -6,13 +6,14 @@ import { ExpoVoiceAgent } from "@/components/expo-audio/voice-agent";
 import {
   useWorkshopColors,
   WorkshopSurface,
-  workshopStyles,
+  useWorkshopStyles,
 } from "@/lib/workshop-ui";
 
 type AlternativeMode = "half-duplex" | "aec-diagnostic";
 
 export default function ExpoAlternativesScreen() {
   const colors = useWorkshopColors();
+  const workshopStyles = useWorkshopStyles();
   const [mode, setMode] = useState<AlternativeMode>("half-duplex");
   const [diagnosticNotice, setDiagnosticNotice] = useState<string | null>(null);
 
@@ -39,7 +40,7 @@ export default function ExpoAlternativesScreen() {
                 <Text
                   style={[
                     workshopStyles.modeLabel,
-                    { color: mode === option ? "white" : colors.text },
+                    { color: mode === option ? colors.accentText : colors.text },
                   ]}
                 >
                   {option === "half-duplex" ? "Half duplex" : "AEC diagnostic"}

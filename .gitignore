@@ -30,9 +30,9 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
-.env*.local
-.env
+# Local credentials; only the empty setup example is public.
+.env*
+!.env.example
 
 # typescript
 *.tsbuildinfo
@@ -45,4 +45,6 @@ yarn-error.*
 /.codex
 /.cursor
 /.claude
-.env
+/.agents
+/.vscode
+*.log

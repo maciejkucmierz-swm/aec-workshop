@@ -17,6 +17,9 @@ import {
   type AudioStreamProfile,
 } from "@/lib/audio-engine";
 import { serializeAudioLifecycle } from "@/lib/audio-lifecycle";
+import { IS_PROMO } from "@/lib/app-mode";
+import { usePromoConnection } from "@/lib/use-promo-connection";
+import { PromoVoiceScreen } from "@/components/promo-voice-screen";
 import {
   RealtimeSession,
   type SessionDiagnostics,
@@ -26,9 +29,8 @@ import {
 import {
   useWorkshopColors,
   WorkshopHeading,
-  WORKSHOP_STATUS_COLOR,
   WorkshopSurface,
-  workshopStyles,
+  useWorkshopStyles,
 } from "@/lib/workshop-ui";
 
 type Mode = "text" | "voice";
@@ -71,9 +73,10 @@ export function VoiceScreen({
   implementationDescription,
 }: VoiceScreenProps) {
   const colors = useWorkshopColors();
+  const workshopStyles = useWorkshopStyles();
   const [status, setStatus] = useState<SessionStatus>("idle");
   const [detail, setDetail] = useState<string | null>(null);
-  const [mode, setMode] = useState<Mode>("text");
+  const [mode, setMode] = useState<Mode>(IS_PROMO ? "voice" : "text");
   const [micOn, setMicOn] = useState(false);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
@@ -122,10 +125,18 @@ export function VoiceScreen({
     });
   });
 
+  const { connection: promoConnection, requested: promoRequested, toggle: togglePromo } = usePromoConnection({
+    status,
+    microphoneActive: micOn,
+    connect: () => session.connect({ waitForSessionReady: true }),
+    disconnect: () => session.disconnect(),
+    startMic: () => session.startMic(),
+  });
+
   // Synchronize the selected interaction mode once the socket is ready. This
   // also honors a Voice selection made while the connection was still opening.
   useEffect(() => {
-    if (status !== "connected") {
+    if (IS_PROMO || status !== "connected") {
       return;
     }
     if (mode === "voice") {
@@ -135,16 +146,11 @@ export function VoiceScreen({
     }
   }, [mode, session, status]);
 
-  useEffect(() => {
-    return () => {
-      void session.disconnect();
-    };
-  }, [session]);
-
   // Native tabs retain their screens. End a hidden call so its stream cannot
   // overlap the other comparison profile.
   useFocusEffect(
     useCallback(() => {
+      if (IS_PROMO) return;
       return () => {
         void session.disconnect();
       };
@@ -153,8 +159,19 @@ export function VoiceScreen({
 
   const isBusy = status === "connecting" || status === "disconnecting";
   const isLive = status === "connected";
+  const assistantPlaying = isLive && diagnostics?.playbackAudible &&
+    (diagnostics.playbackState === "playing" || diagnostics.playbackState === "decoding");
 
   const toggleConnection = useCallback(() => {
+    if (IS_PROMO) {
+      if (!promoRequested || status === "error") {
+        setEntries([]);
+        setDetail(null);
+        setWarning(null);
+      }
+      togglePromo();
+      return;
+    }
     if (isLive || isBusy) {
       void session.disconnect();
       return;
@@ -164,7 +181,7 @@ export function VoiceScreen({
     setDetail(null);
     setWarning(null);
     void session.connect();
-  }, [isBusy, isLive, session]);
+  }, [isBusy, isLive, promoRequested, session, status, togglePromo]);
 
   const sendDraft = useCallback(() => {
     session.sendText(draft);
@@ -203,6 +220,23 @@ export function VoiceScreen({
       diagnostics.recentEvents.length > 0 ||
       diagnostics.closeInfo !== null);
 
+  if (IS_PROMO) {
+    return (
+      <WorkshopSurface>
+        <PromoVoiceScreen
+          connection={promoConnection}
+          microphoneActive={promoRequested && micOn}
+          userSpeaking={userSpeaking}
+          assistantPlaying={Boolean(assistantPlaying)}
+          entries={entries}
+          error={detail}
+          warning={warning}
+          onToggleConnection={toggleConnection}
+        />
+      </WorkshopSurface>
+    );
+  }
+
   const content = (
     <View style={workshopStyles.content}>
       <WorkshopHeading
@@ -210,19 +244,19 @@ export function VoiceScreen({
         description={implementationDescription}
       />
       <View style={workshopStyles.statusRow}>
-        <View style={[workshopStyles.statusDot, { backgroundColor: WORKSHOP_STATUS_COLOR[status] }]} />
+        <View style={[workshopStyles.statusDot, { backgroundColor: colors.status[status] }]} />
         <Text style={[workshopStyles.statusText, { color: colors.text }]}>
           {STATUS_LABEL[status]}
         </Text>
         {isLive ? (
-          <Text style={[styles.activityText, { color: colors.muted }]}>
+          <Text style={[workshopStyles.activityText, { color: colors.muted }]}>
             {micOn ? (userSpeaking ? "hearing speech" : "listening") : "mic off"}
           </Text>
         ) : null}
       </View>
 
-      {detail ? <Text style={styles.detailText}>{detail}</Text> : null}
-      {warning ? <Text style={styles.warningText}>{warning}</Text> : null}
+      {detail ? <Text style={workshopStyles.detailText}>{detail}</Text> : null}
+      {warning ? <Text style={workshopStyles.warningText}>{warning}</Text> : null}
 
       <ScrollView
         ref={scrollRef}
@@ -231,16 +265,16 @@ export function VoiceScreen({
         onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
       >
         {entries.length === 0 ? (
-          <Text style={[styles.placeholder, { color: colors.muted }]}>
+          <Text style={[workshopStyles.placeholder, { color: colors.muted }]}>
             Connect, then pick Text to type or Voice to talk.
           </Text>
         ) : (
           entries.map((entry) => (
             <View key={entry.id} style={styles.entry}>
-              <Text style={[styles.entryRole, { color: colors.muted }]}>
+              <Text style={[workshopStyles.entryRole, { color: colors.muted }]}>
                 {entry.role === "user" ? "You" : "Assistant"}
               </Text>
-              <Text style={[styles.entryText, { color: colors.text }]}>{entry.text}</Text>
+              <Text style={[workshopStyles.entryText, { color: colors.text }]}>{entry.text}</Text>
             </View>
           ))
         )}
@@ -252,7 +286,7 @@ export function VoiceScreen({
           onPress={() => setDebugOpen((current) => !current)}
         >
           <Text
-            style={[styles.debugText, { color: colors.muted }]}
+            style={[workshopStyles.debugText, { color: colors.muted }]}
             numberOfLines={1}
           >
             {`mic ${diagnostics.micChunks} · vad ${diagnostics.speechTriggers}/${diagnostics.triggersWhileSpeaking}/${diagnostics.confirmedEchoes} · leak ${formatLeak(
@@ -263,48 +297,48 @@ export function VoiceScreen({
           </Text>
           {debugOpen ? (
             <ScrollView style={styles.debugScroll} nestedScrollEnabled>
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`mic ${diagnostics.micChunks} chunks / ${formatBytes(diagnostics.micBytes)}`}
               </Text>
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`audio ${diagnostics.audioDeltas} deltas / ${diagnostics.buffersQueued} queued / ${diagnostics.buffersEnded} ended`}
               </Text>
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`playback ${diagnostics.playbackState} / context ${diagnostics.contextState}`}
               </Text>
               {diagnostics.lastBufferInfo ? (
-                <Text style={[styles.debugText, { color: colors.muted }]}>
+                <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                   {`buffer ${diagnostics.lastBufferInfo}`}
                 </Text>
               ) : null}
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`levels mic rms ${diagnostics.micRms.toFixed(4)} / quiet baseline ${diagnostics.micBaseline.toFixed(4)}${
                   diagnostics.playbackAudible ? " / speaker ON" : ""
                 }`}
               </Text>
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`echo ${diagnostics.echoLevel.toFixed(4)} while speaking = ${formatLeak(
                   diagnostics.echoLeakDb
                 )} over floor`}
               </Text>
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`vad ${diagnostics.speechTriggers} triggers, ${diagnostics.triggersWhileSpeaking} while speaker on, ${diagnostics.confirmedEchoes} echo`}
               </Text>
               {diagnostics.lastIncident ? (
-                <Text style={[styles.debugText, { color: colors.muted }]}>
+                <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                   {`last ${diagnostics.lastIncident}`}
                 </Text>
               ) : null}
-              <Text style={[styles.debugText, { color: colors.muted }]}>
+              <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                 {`events ${diagnostics.recentEvents.join(", ") || "none yet"}`}
               </Text>
               {diagnostics.captureInfo ? (
-                <Text style={[styles.debugText, { color: colors.muted }]}>
+                <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                   {`capture ${diagnostics.captureInfo}`}
                 </Text>
               ) : null}
               {diagnostics.closeInfo ? (
-                <Text style={[styles.debugText, { color: colors.muted }]}>
+                <Text style={[workshopStyles.debugText, { color: colors.muted }]}>
                   {`closed ${diagnostics.closeInfo}`}
                 </Text>
               ) : null}
@@ -335,24 +369,22 @@ export function VoiceScreen({
         </Pressable>
       </View>
 
-      <View style={workshopStyles.utilityRow}>
+      <View style={[workshopStyles.modeRow, { borderColor: colors.border }]}>
         {(["earpiece", "speaker"] as const).map((option) => {
           const selected = route === option;
           return (
             <Pressable
               key={option}
-              style={[
-                workshopStyles.utilityButton,
-                { borderColor: colors.border },
-                selected && workshopStyles.utilityButtonActive,
-              ]}
+              style={[workshopStyles.modeButton, selected && workshopStyles.modeButtonSelected]}
               // Switchable mid-call: routing is independent of the streams.
               onPress={() => void chooseRoute(option)}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
             >
               <Text
                 style={[
-                  workshopStyles.utilityLabel,
-                  { color: selected ? "white" : colors.text },
+                  workshopStyles.modeLabel,
+                  { color: selected ? colors.accentText : colors.text },
                 ]}
               >
                 {option === "earpiece" ? "Phone" : "Speaker"}
@@ -363,7 +395,7 @@ export function VoiceScreen({
       </View>
 
       {routeInfo ? (
-        <Text style={[styles.routeInfoText, { color: colors.muted }]}>
+        <Text style={[workshopStyles.routeInfoText, { color: colors.muted }]}>
           {`output: ${routeInfo}`}
         </Text>
       ) : null}
@@ -376,11 +408,13 @@ export function VoiceScreen({
               key={option}
               style={[workshopStyles.modeButton, selected && workshopStyles.modeButtonSelected]}
               onPress={() => setMode(option)}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
             >
               <Text
                 style={[
                   workshopStyles.modeLabel,
-                  { color: selected ? "white" : colors.text },
+                  { color: selected ? colors.accentText : colors.text },
                 ]}
               >
                 {option === "text" ? "Text" : "Voice"}
@@ -399,7 +433,7 @@ export function VoiceScreen({
         onPress={toggleConnection}
         disabled={status === "disconnecting"}
       >
-        <Text style={workshopStyles.callLabel}>
+        <Text style={[workshopStyles.callLabel, (isLive || isBusy) && workshopStyles.callLabelStop]}>
           {status === "disconnecting" ? "Disconnecting" : isBusy ? "Connecting" : isLive ? "Disconnect" : "Connect"}
         </Text>
       </Pressable>
@@ -409,29 +443,17 @@ export function VoiceScreen({
   return <WorkshopSurface>{content}</WorkshopSurface>;
 }
 
-export default function PatchedVoiceScreen() {
+export default function VoiceProcessingScreen() {
   return (
     <VoiceScreen
       audioStreamProfile="voice-processing"
-      implementationName="Patched voice-processing audio"
+      implementationName="RNAA voice-processing audio"
       implementationDescription="Communication streams with platform voice processing enabled."
     />
   );
 }
 
 const styles = StyleSheet.create({
-  activityText: {
-    fontSize: 14,
-    opacity: 0.6,
-  },
-  detailText: {
-    fontSize: 13,
-    color: "#FF453A",
-  },
-  warningText: {
-    fontSize: 13,
-    color: "#FF9F0A",
-  },
   debugPanel: {
     borderRadius: 8,
     paddingHorizontal: 8,
@@ -442,10 +464,6 @@ const styles = StyleSheet.create({
   debugScroll: {
     maxHeight: 120,
   },
-  debugText: {
-    fontSize: 10,
-    lineHeight: 14,
-  },
   transcript: {
     flex: 1,
   },
@@ -453,21 +471,7 @@ const styles = StyleSheet.create({
     gap: 12,
     paddingVertical: 8,
   },
-  placeholder: {
-    opacity: 0.5,
-  },
   entry: {
     gap: 2,
-  },
-  entryRole: {
-    fontSize: 12,
-    fontWeight: "600",
-    opacity: 0.5,
-  },
-  entryText: {
-    fontSize: 16,
-  },
-  routeInfoText: {
-    fontSize: 11,
   },
 });
